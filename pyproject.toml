@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confab-framework"
+version = "0.1.0"
+description = "Structural confabulation detection and prevention for multi-agent systems"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["agents", "confabulation", "verification", "multi-agent", "llm", "ai-safety"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/dennischoubot-glitch/confab-framework"
+Repository = "https://github.com/dennischoubot-glitch/confab-framework"
+Issues = "https://github.com/dennischoubot-glitch/confab-framework/issues"
+
+[project.scripts]
+confab = "confab.cli:main"
+
+[tool.setuptools]
+packages = ["confab"]
+
+[tool.setuptools.package-dir]
+confab = "."

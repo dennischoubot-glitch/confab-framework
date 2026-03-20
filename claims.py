@@ -1,0 +1,495 @@
+"""Claim extraction and classification for the confabulation framework.
+
+Parses agent priority files and handoff text to identify carry-forward claims,
+classify them by type, and determine which are auto-verifiable.
+
+The key insight: most cascade-propagating confabulations in the ia system are
+verifiable claims about system state (file exists, env var present, pipeline
+works/blocked) that persist because no agent checks reality. This module
+extracts those claims so the verification engine can test them.
+"""
+
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class ClaimType(Enum):
+    """Types of claims agents make in priority files."""
+    FILE_EXISTS = "file_exists"          # "X file exists / is ready"
+    FILE_MISSING = "file_missing"        # "X file is missing / doesn't exist"
+    ENV_VAR = "env_var"                  # "needs ENV_VAR" / "ENV_VAR is set"
+    PIPELINE_WORKS = "pipeline_works"    # "pipeline X is working"
+    PIPELINE_BLOCKED = "pipeline_blocked" # "X is blocked on Y"
+    SCRIPT_RUNS = "script_runs"          # "script X works / runs"
+    SCRIPT_BROKEN = "script_broken"      # "script X fails / is broken"
+    CONFIG_PRESENT = "config_present"    # "config X is present / configured"
+    COUNT_CLAIM = "count_claim"          # "X entries / N items / count of Y"
+    STATUS_CLAIM = "status_claim"        # general status assertions
+    FACT_CLAIM = "fact_claim"            # factual claims (dates, numbers)
+    SUBJECTIVE = "subjective"            # opinions, assessments
+
+
+class VerifiabilityLevel(Enum):
+    """How automatically verifiable a claim is."""
+    AUTO = "auto"           # Can be verified by code right now
+    SEMI = "semi"           # Partially verifiable (needs some context)
+    MANUAL = "manual"       # Requires human/agent judgment
+
+
+@dataclass
+class Claim:
+    """A single extracted claim from agent text."""
+    text: str                          # Original text of the claim
+    claim_type: ClaimType              # Classification
+    verifiability: VerifiabilityLevel  # How verifiable
+    source_file: Optional[str] = None  # File the claim was extracted from
+    source_line: Optional[int] = None  # Line number
+    verification_tag: Optional[str] = None  # Existing [v1]/[v2]/[unverified] tag
+    extracted_paths: List[str] = field(default_factory=list)  # File paths mentioned
+    extracted_env_vars: List[str] = field(default_factory=list)  # Env vars mentioned
+    extracted_numbers: List[str] = field(default_factory=list)  # Numbers/counts
+    extracted_config_keys: List[str] = field(default_factory=list)  # Config keys to check
+    context: str = ""                  # Surrounding text for context
+    age_builds: int = 0                # How many builds this has persisted
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "type": self.claim_type.value,
+            "verifiability": self.verifiability.value,
+            "source_file": self.source_file,
+            "source_line": self.source_line,
+            "verification_tag": self.verification_tag,
+            "paths": self.extracted_paths,
+            "env_vars": self.extracted_env_vars,
+            "numbers": self.extracted_numbers,
+            "config_keys": self.extracted_config_keys,
+            "age_builds": self.age_builds,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pattern definitions for claim extraction
+# ---------------------------------------------------------------------------
+
+# File path pattern (matches common project paths)
+FILE_PATH_RE = re.compile(
+    r'`([^`]+\.(?:py|md|json|html|txt|yaml|yml|sh|js|ts|swift|css|db|conf|env|toml|cfg))`'
+    r'|(?:^|\s)((?:[\w./-]+/)+[\w.-]+\.(?:py|md|json|html|txt|yaml|yml|sh|js|ts|swift|css|db|conf|env|toml|cfg))',
+)
+
+# Environment variable pattern
+ENV_VAR_RE = re.compile(
+    r'\b([A-Z][A-Z0-9_]{2,}(?:_KEY|_TOKEN|_SECRET|_URL|_PATH|_API|_ID|_PASSWORD|_COOKIE)?)\b'
+)
+
+# Default known env var names (always checked).
+# Extended at runtime with any config-provided env vars via _get_all_known_env_vars().
+_DEFAULT_KNOWN_ENV_VARS = {
+    'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
+    'KALSHI_API_KEY', 'KALSHI_KEY_ID', 'KALSHI_PRIVATE_KEY',
+    'SUBSTACK_COOKIE', 'SUBSTACK_TOKEN', 'SUBSTACK_SID',
+    'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_WEBHOOK',
+    'DEVTO_API_KEY', 'GITHUB_TOKEN', 'DATABASE_URL',
+    'SECRET_KEY', 'API_KEY', 'AWS_ACCESS_KEY_ID',
+    'AWS_SECRET_ACCESS_KEY', 'GOOGLE_API_KEY',
+}
+
+# Backwards-compatible alias
+KNOWN_ENV_VARS = _DEFAULT_KNOWN_ENV_VARS
+
+
+def _get_all_known_env_vars() -> set:
+    """Merge default known env vars with any configured extras."""
+    try:
+        from .config import get_config
+        return _DEFAULT_KNOWN_ENV_VARS | get_config().known_env_vars
+    except Exception:
+        return _DEFAULT_KNOWN_ENV_VARS
+
+# Verification tag patterns
+VERIFICATION_TAG_RE = re.compile(
+    r'\[(v[12]):\s*(?:checked\s+)?(.+?)(?:\s+\d{4}-\d{2}-\d{2})?\]'
+    r'|\[(unverified)\]'
+    r'|\[(verified(?::\s*\d{4}-\d{2}-\d{2})?)\]'
+    r'|\[FAILED:\s*(.+?)\]'
+)
+
+# Blocker/blocked patterns
+BLOCKER_RE = re.compile(
+    r'(?:blocked\s+(?:on|by)|waiting\s+(?:on|for)|needs|requires|depends\s+on|missing)\s+(.+?)(?:\.|$|\n|—)',
+    re.IGNORECASE,
+)
+
+# Pipeline/script status patterns
+PIPELINE_STATUS_RE = re.compile(
+    r'(?:pipeline|script|cron|process|service)\s+(?:is\s+)?'
+    r'(?:working|running|operational|active|healthy|broken|failing|down|blocked|stopped)',
+    re.IGNORECASE,
+)
+
+# Count/quantity claims
+COUNT_RE = re.compile(
+    r'(\d+)\s+(?:entries|items|posts|notes|files|tests|builds|sprints|days|hours|commits|'
+    r'observations|ideas|principles|scripts|databases|subscribers|views)',
+    re.IGNORECASE,
+)
+
+# Build section header pattern (to track claim age)
+BUILD_HEADER_RE = re.compile(
+    r'^##\s+(?:Latest|Previous|Current)\s+Build\s+\((.+?)\)',
+    re.MULTILINE,
+)
+
+# Meta-rule pattern — lines that describe how to handle claims, not claims themselves.
+# e.g. "**Staleness rule:** ...", "**Rules:** ...", "**Size rule:** ..."
+META_RULE_RE = re.compile(
+    r'^\w[\w\s]*rules?\s*:',
+    re.IGNORECASE,
+)
+
+# Config file detection
+CONFIG_FILE_EXTS = {'.json', '.yaml', '.yml', '.toml', '.cfg', '.conf', '.ini'}
+
+CONFIG_ASSERTION_RE = re.compile(
+    r'\b(?:config(?:ured|uration)?|setting|key\b|has\s+key|contains?\s+key)\b',
+    re.IGNORECASE,
+)
+
+# Config key pattern: backtick-enclosed identifiers that aren't file paths
+CONFIG_KEY_RE = re.compile(r'`([a-zA-Z_][a-zA-Z0-9_.]*)`')
+
+# Optional/conditional language — when present, file references are not existence assertions.
+# e.g. "loads confab.toml or falls back to defaults", "reads config.yaml if present"
+OPTIONAL_FILE_RE = re.compile(
+    r'\b(?:if\s+(?:\w+\s+)?(?:present|exists?|found|available)'
+    r'|or\s+(?:falls?\s+back|defaults?\s+to|uses?\s+defaults?)'
+    r'|optional(?:ly)?'
+    r'|when\s+(?:present|available|found)'
+    r'|(?:falls?\s+back|defaults?)\s+(?:to|if))\b',
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Claim extraction
+# ---------------------------------------------------------------------------
+
+def extract_claims(
+    text: str,
+    source_file: Optional[str] = None,
+) -> List[Claim]:
+    """Extract verifiable claims from agent text.
+
+    Scans text for patterns that indicate testable assertions:
+    - File existence/absence claims
+    - Environment variable requirements
+    - Pipeline/script status claims
+    - Blocker assertions
+    - Count/quantity claims
+    - General status claims with verification tags
+
+    Returns a list of Claim objects, sorted by verifiability (auto first).
+    """
+    claims = []
+    lines = text.split('\n')
+
+    # Track build sections for age estimation
+    build_sections = list(BUILD_HEADER_RE.finditer(text))
+    current_build_idx = 0
+
+    for line_num, line in enumerate(lines, 1):
+        # Update build section tracking
+        for i, m in enumerate(build_sections):
+            if m.start() <= sum(len(l) + 1 for l in lines[:line_num - 1]):
+                current_build_idx = i
+
+        # Skip headers, empty lines, and table formatting
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith('|---'):
+            continue
+
+        # Skip meta-rules about claim handling (e.g. "**Staleness rule:** ...")
+        # These describe how to process claims, not assertions about system state.
+        clean_for_rule_check = stripped.replace('*', '').strip()
+        if META_RULE_RE.match(clean_for_rule_check):
+            continue
+
+        # Extract existing verification tags
+        vtag_match = VERIFICATION_TAG_RE.search(line)
+        vtag = None
+        if vtag_match:
+            vtag = vtag_match.group(0)
+
+        # --- Blocker claims (highest priority — these are the cascade propagators) ---
+        blocker_matches = BLOCKER_RE.findall(line)
+        if blocker_matches:
+            for blocker_text in blocker_matches:
+                claim = _classify_blocker_claim(
+                    line, blocker_text.strip(), source_file, line_num, vtag, current_build_idx
+                )
+                if claim:
+                    claims.append(claim)
+            continue  # Don't double-count
+
+        # --- Pipeline/script status claims ---
+        if PIPELINE_STATUS_RE.search(line):
+            claim = _classify_status_claim(
+                line, source_file, line_num, vtag, current_build_idx
+            )
+            if claim:
+                claims.append(claim)
+            continue
+
+        # --- File path and config file references in assertion context ---
+        file_paths = _extract_file_paths(line)
+        if file_paths and _is_assertion_context(line) and not _is_optional_reference(line):
+            if _is_config_assertion(line, file_paths):
+                config_keys = _extract_config_keys(line, file_paths)
+                claim = Claim(
+                    text=stripped,
+                    claim_type=ClaimType.CONFIG_PRESENT,
+                    verifiability=VerifiabilityLevel.AUTO,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_paths=file_paths,
+                    extracted_config_keys=config_keys,
+                    age_builds=current_build_idx,
+                )
+            else:
+                claim = Claim(
+                    text=stripped,
+                    claim_type=ClaimType.FILE_EXISTS,
+                    verifiability=VerifiabilityLevel.AUTO,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_paths=file_paths,
+                    age_builds=current_build_idx,
+                )
+            claims.append(claim)
+            continue
+
+        # --- Count/quantity claims ---
+        count_matches = COUNT_RE.findall(line)
+        if count_matches and _is_assertion_context(line):
+            claim = Claim(
+                text=stripped,
+                claim_type=ClaimType.COUNT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=count_matches,
+                age_builds=current_build_idx,
+            )
+            claims.append(claim)
+
+    # Sort: auto-verifiable first, then semi, then manual
+    priority = {VerifiabilityLevel.AUTO: 0, VerifiabilityLevel.SEMI: 1, VerifiabilityLevel.MANUAL: 2}
+    claims.sort(key=lambda c: (priority[c.verifiability], -c.age_builds))
+
+    return claims
+
+
+def _extract_file_paths(text: str) -> List[str]:
+    """Extract file paths from text."""
+    paths = []
+    for match in FILE_PATH_RE.finditer(text):
+        path = match.group(1) or match.group(2)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _is_assertion_context(line: str) -> bool:
+    """Check if a line contains an assertion (not just a reference)."""
+    assertion_words = {
+        'exists', 'ready', 'working', 'works', 'runs', 'running',
+        'blocked', 'broken', 'failing', 'missing', 'needs', 'requires',
+        'present', 'configured', 'deployed', 'operational', 'healthy',
+        'queued', 'pending', 'complete', 'completed', 'done', 'fixed',
+        'added', 'created', 'updated', 'verified', 'confirmed',
+        'status', 'still', 'not', 'should', 'must',
+    }
+    lower = line.lower()
+    return any(word in lower for word in assertion_words)
+
+
+def _is_optional_reference(line: str) -> bool:
+    """Check if a line describes a file as optional/conditional.
+
+    Lines like "loads confab.toml or falls back to ia defaults" should not
+    be treated as assertions that the file must exist. The file reference
+    is conditional — the system works without it.
+    """
+    return bool(OPTIONAL_FILE_RE.search(line))
+
+
+def _is_config_assertion(line: str, file_paths: List[str]) -> bool:
+    """Check if a line is a config-related assertion about config files."""
+    has_config_file = any(
+        Path(p).suffix.lower() in CONFIG_FILE_EXTS for p in file_paths
+    )
+    has_config_words = bool(CONFIG_ASSERTION_RE.search(line))
+    return has_config_file and has_config_words
+
+
+def _extract_config_keys(line: str, file_paths: List[str]) -> List[str]:
+    """Extract config key names from backticked text in a line.
+
+    Returns identifiers in backticks that aren't file paths. These are
+    candidate config keys to verify in the referenced config file.
+    """
+    keys = []
+    file_path_set = set(file_paths)
+    file_exts = {'.py', '.md', '.json', '.yaml', '.yml', '.toml', '.html',
+                 '.js', '.ts', '.css', '.sh', '.swift', '.txt', '.db',
+                 '.conf', '.env', '.cfg', '.ini'}
+    for match in CONFIG_KEY_RE.finditer(line):
+        candidate = match.group(1)
+        # Skip if it's a detected file path
+        if candidate in file_path_set:
+            continue
+        # Skip if it looks like a file path
+        if '/' in candidate:
+            continue
+        # Skip if it looks like a file with extension
+        if '.' in candidate:
+            suffix = '.' + candidate.rsplit('.', 1)[-1]
+            if suffix.lower() in file_exts:
+                continue
+        keys.append(candidate)
+    return keys
+
+
+def _classify_blocker_claim(
+    line: str,
+    blocker_text: str,
+    source_file: Optional[str],
+    line_num: int,
+    vtag: Optional[str],
+    build_idx: int,
+) -> Optional[Claim]:
+    """Classify a blocker claim by what it's blocked on."""
+    # Scan the FULL LINE for env vars, not just the blocker capture group.
+    # The regex captures up to the first delimiter, but env var names often
+    # appear later in the line (e.g., "needs cookie — fails without SUBSTACK_COOKIE").
+    scan_text = line
+
+    # Check for env var blockers
+    env_vars = []
+    all_known = _get_all_known_env_vars()
+    for var in all_known:
+        if var.lower() in scan_text.lower() or var in scan_text:
+            env_vars.append(var)
+
+    # Check for generic env var pattern in full line
+    for match in ENV_VAR_RE.finditer(scan_text):
+        candidate = match.group(1)
+        if candidate in all_known or candidate.endswith(('_KEY', '_TOKEN', '_SECRET', '_COOKIE')):
+            if candidate not in env_vars:
+                env_vars.append(candidate)
+
+    if env_vars:
+        return Claim(
+            text=line.strip(),
+            claim_type=ClaimType.ENV_VAR,
+            verifiability=VerifiabilityLevel.AUTO,
+            source_file=source_file,
+            source_line=line_num,
+            verification_tag=vtag,
+            extracted_env_vars=env_vars,
+            age_builds=build_idx,
+        )
+
+    # Check for file-based blockers
+    file_paths = _extract_file_paths(blocker_text)
+    if file_paths:
+        return Claim(
+            text=line.strip(),
+            claim_type=ClaimType.FILE_MISSING,
+            verifiability=VerifiabilityLevel.AUTO,
+            source_file=source_file,
+            source_line=line_num,
+            verification_tag=vtag,
+            extracted_paths=file_paths,
+            age_builds=build_idx,
+        )
+
+    # General blocker — semi-verifiable
+    return Claim(
+        text=line.strip(),
+        claim_type=ClaimType.PIPELINE_BLOCKED,
+        verifiability=VerifiabilityLevel.SEMI,
+        source_file=source_file,
+        source_line=line_num,
+        verification_tag=vtag,
+        age_builds=build_idx,
+    )
+
+
+def _classify_status_claim(
+    line: str,
+    source_file: Optional[str],
+    line_num: int,
+    vtag: Optional[str],
+    build_idx: int,
+) -> Optional[Claim]:
+    """Classify a pipeline/script status claim."""
+    lower = line.lower()
+
+    # Determine if it's a "works" or "broken" claim
+    positive_words = {'working', 'running', 'operational', 'active', 'healthy'}
+    negative_words = {'broken', 'failing', 'down', 'blocked', 'stopped'}
+
+    is_positive = any(w in lower for w in positive_words)
+    is_negative = any(w in lower for w in negative_words)
+
+    claim_type = ClaimType.PIPELINE_BLOCKED if is_negative else ClaimType.PIPELINE_WORKS
+
+    # Extract any file paths (scripts being referenced)
+    file_paths = _extract_file_paths(line)
+
+    return Claim(
+        text=line.strip(),
+        claim_type=claim_type,
+        verifiability=VerifiabilityLevel.AUTO if file_paths else VerifiabilityLevel.SEMI,
+        source_file=source_file,
+        source_line=line_num,
+        verification_tag=vtag,
+        extracted_paths=file_paths,
+        age_builds=build_idx,
+    )
+
+
+def extract_claims_from_file(file_path: str) -> List[Claim]:
+    """Extract claims from a file on disk."""
+    path = Path(file_path)
+    if not path.exists():
+        return []
+    text = path.read_text()
+    return extract_claims(text, source_file=str(path))
+
+
+def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:
+    """Generate a summary of extracted claims."""
+    by_type = {}
+    by_verifiability = {}
+    for c in claims:
+        by_type[c.claim_type.value] = by_type.get(c.claim_type.value, 0) + 1
+        by_verifiability[c.verifiability.value] = by_verifiability.get(c.verifiability.value, 0) + 1
+
+    return {
+        "total": len(claims),
+        "by_type": by_type,
+        "by_verifiability": by_verifiability,
+        "auto_verifiable": by_verifiability.get("auto", 0),
+        "oldest_build_age": max((c.age_builds for c in claims), default=0),
+        "untagged": sum(1 for c in claims if c.verification_tag is None),
+    }

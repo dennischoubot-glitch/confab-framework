@@ -1,0 +1,44 @@
+"""Confabulation Framework — structural detection and prevention for multi-agent systems.
+
+Solves the cascade propagation problem: agents state falsehoods confidently,
+other agents copy them forward indefinitely. This framework makes verification
+structural (enforced by code) rather than aspirational (suggested by docs).
+
+Quick start (CLI)::
+
+    pip install confab-framework
+    confab init                        # generate a confab.toml
+    confab gate                        # run the cascade gate
+
+Quick start (Python API)::
+
+    from confab import ConfabGate
+
+    gate = ConfabGate("confab.toml")
+    report = gate.run()
+
+    if report.has_failures:
+        print(report.format_report())
+
+See DESIGN.md for architecture.
+"""
+
+from .config import ConfabConfig, get_config, load_config, set_config
+from .gate import run_gate, quick_check, GateReport, ConfabGate
+from .claims import extract_claims, extract_claims_from_file, Claim, ClaimType
+from .verify import verify_claim, verify_all, VerificationResult, VerificationOutcome
+
+__version__ = "0.1.0"
+
+__all__ = [
+    # High-level API
+    "ConfabGate",
+    # Configuration
+    "ConfabConfig", "get_config", "load_config", "set_config",
+    # Gate (function-based)
+    "run_gate", "quick_check", "GateReport",
+    # Claims
+    "extract_claims", "extract_claims_from_file", "Claim", "ClaimType",
+    # Verification
+    "verify_claim", "verify_all", "VerificationResult", "VerificationOutcome",
+]
