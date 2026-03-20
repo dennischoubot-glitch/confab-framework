@@ -746,13 +746,20 @@ def _verify_regex_count(
 def _verify_test_count(
     claim: Claim, root: Path, now: str,
 ) -> VerificationOutcome:
-    """Verify test count claims by counting test functions."""
-    test_dir = root / "tests"
-    if not test_dir.exists():
+    """Verify test count claims by counting test functions.
+
+    Scope-aware: if the claim mentions a specific component (e.g. "confab tests",
+    "synthesis tests"), searches for a tests/ directory under that component first.
+    Falls back to the workspace-level tests/ directory.
+    """
+    test_dir = _find_scoped_test_dir(claim.text, root)
+    scope_label = str(test_dir.relative_to(root)) if test_dir else "tests/"
+
+    if test_dir is None or not test_dir.exists():
         return VerificationOutcome(
             claim=claim,
             result=VerificationResult.FAILED,
-            evidence="tests/ directory not found",
+            evidence=f"{scope_label} directory not found",
             checked_at=now,
             method="count_check",
         )
@@ -769,7 +776,7 @@ def _verify_test_count(
     claimed = int(claim.extracted_numbers[0])
     evidence = (
         f"  Claimed: {claimed} tests\n"
-        f"  Actual: {test_count} test functions in {len(test_files)} files\n"
+        f"  Actual: {test_count} test functions in {len(test_files)} files under {scope_label}\n"
     )
 
     tolerance = max(claimed * 0.2, 3)
@@ -784,6 +791,37 @@ def _verify_test_count(
         claim=claim, result=result, evidence=evidence,
         checked_at=now, method="count_check",
     )
+
+
+def _find_scoped_test_dir(claim_text: str, root: Path) -> Optional[Path]:
+    """Find the most specific test directory matching the claim's scope.
+
+    If the claim mentions a known component name (e.g. "confab", "synthesis"),
+    looks for a tests/ directory under that component's path. This prevents
+    false positives where a claim about "154 confab tests" gets checked against
+    526 tests across the entire workspace.
+
+    Returns None if no test directory is found.
+    """
+    claim_lower = claim_text.lower()
+
+    # Search for component-scoped test directories
+    # Check common patterns: core/<name>/tests/, projects/<name>/tests/
+    for prefix in ("core", "projects"):
+        prefix_dir = root / prefix
+        if not prefix_dir.is_dir():
+            continue
+        for child in sorted(prefix_dir.iterdir()):
+            if child.is_dir() and child.name.lower() in claim_lower:
+                tests_dir = child / "tests"
+                if tests_dir.is_dir():
+                    return tests_dir
+
+    # No scoped match — fall back to workspace-level tests/
+    fallback = root / "tests"
+    if fallback.exists():
+        return fallback
+    return None
 
 
 # ---------------------------------------------------------------------------
