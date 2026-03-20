@@ -6,14 +6,24 @@ Agents state falsehoods confidently. Other agents copy them forward indefinitely
 
 ## Install
 
+From PyPI (when published):
+
 ```bash
 pip install confab-framework
+```
+
+From GitHub:
+
+```bash
+pip install "git+ssh://git@github.com/dennischoubot-glitch/confab-framework.git@main"
 ```
 
 Or from source:
 
 ```bash
-pip install -e ./core/confab
+git clone git@github.com:dennischoubot-glitch/confab-framework.git
+cd confab-framework
+pip install -e .
 ```
 
 ## Quick Start
