@@ -88,13 +88,12 @@ ENV_VAR_RE = re.compile(
 )
 
 # Default known env var names (always checked).
-# Extended at runtime with any config-provided env vars via _get_all_known_env_vars().
+# These are common env vars found in most projects.
+# Extended at runtime with project-specific env vars via _get_all_known_env_vars()
+# (from confab.toml or ia-repo defaults).
 _DEFAULT_KNOWN_ENV_VARS = {
     'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
-    'KALSHI_API_KEY', 'KALSHI_KEY_ID', 'KALSHI_PRIVATE_KEY',
-    'SUBSTACK_COOKIE', 'SUBSTACK_TOKEN', 'SUBSTACK_SID',
-    'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_WEBHOOK',
-    'DEVTO_API_KEY', 'GITHUB_TOKEN', 'DATABASE_URL',
+    'GITHUB_TOKEN', 'DATABASE_URL',
     'SECRET_KEY', 'API_KEY', 'AWS_ACCESS_KEY_ID',
     'AWS_SECRET_ACCESS_KEY', 'GOOGLE_API_KEY',
 }

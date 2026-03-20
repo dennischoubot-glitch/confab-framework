@@ -18,20 +18,12 @@ pip install -e ./core/confab
 
 ## Quick Start
 
-### CLI
-
 ```bash
-# Generate a config file
-confab init
-
-# Run the cascade gate (extracts claims, verifies them, reports failures)
-confab gate
-
-# Check a single claim inline
-confab check "Audio is blocked on OPENAI_API_KEY"
-
-# One-line summary for embedding in prompts
-confab quick
+pip install confab-framework
+cd your-project/
+confab init                        # generate a confab.toml
+# Edit confab.toml — add your priority/handoff files to files_to_scan
+confab gate                        # verify carry-forward claims against reality
 ```
 
 ### Python API
@@ -39,7 +31,7 @@ confab quick
 ```python
 from confab import ConfabGate
 
-# Load config from file
+# From a config file
 gate = ConfabGate("confab.toml")
 report = gate.run()
 
@@ -50,35 +42,17 @@ elif report.has_stale:
 else:
     print(f"Clean: {report.passed} claims verified")
 
-# Check specific files
-report = gate.run(files=["docs/handoff.md"])
-
-# Check inline text
-outcomes = gate.check("Pipeline is blocked on OPENAI_API_KEY")
-for outcome in outcomes:
-    print(f"{outcome.result.value}: {outcome.claim.text}")
-
-# One-line summary
-print(gate.quick())
-```
-
-Or use the lower-level function API:
-
-```python
-from confab import load_config, set_config, run_gate
-
-config = load_config(config_path=Path("confab.toml"))
-set_config(config)
-report = run_gate()
+# Check inline text directly
+outcomes = gate.check("Audio pipeline blocked on OPENAI_API_KEY")
+for o in outcomes:
+    print(f"{o.result.value}: {o.evidence}")
 ```
 
 ## How It Works
 
-1. **Extract** -- Scans priority files and handoff text for carry-forward claims (file exists, env var present, pipeline works/blocked, counts)
-2. **Classify** -- Each claim gets a type and verifiability level (auto, semi, manual)
-3. **Verify** -- Auto-verifiable claims are checked against reality (filesystem, env vars, script syntax, config parsing, pipeline outputs)
-4. **Track** -- A persistent SQLite tracker records how many gate runs each claim has survived without verification
-5. **Report** -- Gate reports flag failures (claim contradicts reality) and stale claims (persisted too long without verification)
+Agents in multi-agent systems pass claims forward at handoff points — "the pipeline is blocked on X," "file Y exists," "the config is ready." When an agent states a falsehood confidently, the next agent copies it forward. The confab framework breaks this cascade by extracting claims from handoff text, auto-verifying them against reality (filesystem, environment variables, script syntax, config parsing, pipeline outputs), and tracking how long unverified claims persist. Claims that fail verification get flagged; claims that linger without verification get marked stale. The gate runs at every agent handoff point, supplying the oracle bits that distinguish confabulation from understanding.
+
+The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiability) → **Verify** (check against ground truth) → **Track** (SQLite persistence across runs) → **Report** (failures + staleness + tree health).
 
 ## Commands
 
@@ -91,7 +65,7 @@ report = run_gate()
 | `confab prune` | Identify stale build sections to remove |
 | `confab sweep` | Show tracked claims by staleness |
 | `confab sweep --stats` | Tracker statistics |
-| `confab report` | Slack-friendly concise report |
+| `confab report` | System health dashboard (gate + supports + coverage) |
 | `confab init` | Generate a starter `confab.toml` |
 
 ## Configuration

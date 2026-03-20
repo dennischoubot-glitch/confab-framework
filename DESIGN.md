@@ -138,40 +138,52 @@ The gate runs at two points in the agent lifecycle:
    ```
    If FAILED claims exist, investigate before trusting them. If STALE claims exist, verify or delete before propagating.
 
-2. **Slack report (post-build):** After completing work, the Slack-friendly report can be posted:
+2. **System health report (post-build):** After completing work, the health dashboard can be viewed:
    ```bash
-   python core/confab/cli.py report
+   python core/confab/cli.py report           # terminal dashboard
+   python core/confab/cli.py report --slack    # concise Slack-friendly output
    ```
-   This outputs a concise summary with emoji status indicators, suitable for Slack threads.
+   This combines gate results with knowledge tree supports analysis and verification coverage.
 
 The gate is non-blocking — it produces a report, not a hard stop. This preserves the "wrong > blocked" principle while making verification structural rather than aspirational.
 
-#### 4c. Slack-Friendly Report Command
+#### 4c. System Health Report
 
-`python core/confab/cli.py report` outputs a concise summary:
-- Clean gate: single line with checkmark
-- Issues: emoji-prefixed status lines, max 3 stale details shown, tracker run count
-- No markdown tables, no headers — just status indicators agents (and Dennis) can scan quickly
+`python core/confab/cli.py report` outputs a comprehensive health dashboard combining:
+- Gate results (claims extracted, verified, failed, stale)
+- Knowledge tree supports analysis (zombie/weakened entries)
+- Verification coverage percentage
 
-Example clean output:
+Use `--slack` for a concise Slack-friendly version, `--json` for machine-readable output.
+
+Example terminal output:
 ```
-:white_check_mark: Gate CLEAN — 9 claims, 5 verified
-Run #4 | 0 new, 9 returning
-```
+====================================================
+  CONFAB SYSTEM HEALTH REPORT
+====================================================
 
-Example with issues:
-```
-:x: 2 FAILED | :hourglass: 3 stale | :white_check_mark: 4 passed
-9 claims scanned, 0 inconclusive
+CLAIMS
+  Total: 4  |  Verified: 2  |  Failed: 0  |  Stale: 0
+  Inconclusive: 2  |  Skipped: 0
+  Pass rate: 50% (2/4 auto-verified)
+  Files: builder_priorities.md, dreamer_priorities.md
 
-:x: Audio generation blocked on OPENAI_API_KEY
-  env var OPENAI_API_KEY found in .env
+----------------------------------------------------
 
-:hourglass: [4 runs] Substack publishing needs cookie refresh
-:hourglass: [3 runs] Weather monitor config missing
-  ...and 1 more stale claims
+KNOWLEDGE TREE SUPPORTS
+  Entries checked: 589  |  Zombies: 14  |  Weakened: 13  |  Healthy: 562
+  No supports: 1  |  Invalidated: 518  |  Total tree: 4524
 
-Run #5 | 1 new, 8 returning
+----------------------------------------------------
+
+VERIFICATION COVERAGE
+  Claims verified: 2/4
+  Tree entries healthy: 562/589
+  Combined coverage: 95.1% (564/593)
+
+====================================================
+  STATUS: CRITICAL
+====================================================
 ```
 
 ## Integration Points
@@ -180,7 +192,7 @@ Run #5 | 1 new, 8 returning
 2. **Builder post-flight** — Verify claims in priorities before handoff
 3. **CLI commands:**
    - `gate` — Full gate report (for agent consumption in prompts)
-   - `report` — Concise Slack-friendly report (for posting to Slack threads)
+   - `report` — System health dashboard (gate + supports + coverage); `--slack` for concise output
    - `check` — On-demand verification of inline text
    - `quick` — One-line gate summary (for embedding in prompts)
    - `sweep` — Tracked claims by staleness (persistent across runs)

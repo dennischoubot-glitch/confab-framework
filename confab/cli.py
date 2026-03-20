@@ -28,8 +28,10 @@ Usage:
     confab sweep --stats          # tracker statistics
     confab sweep --history        # gate run history
 
-    # Slack-friendly concise report (for posting to Slack)
+    # System health dashboard (gate + supports + coverage)
     confab report
+    confab report --json
+    confab report --slack   # concise Slack-friendly output
 
     # Check knowledge tree structural integrity (zombie/weakened entries)
     confab check-supports
@@ -259,12 +261,196 @@ def cmd_prune(args):
 
 
 def cmd_report(args):
-    """Print a concise Slack-friendly gate report."""
+    """Print a system health dashboard combining gate + supports analysis."""
+    check_supports = _get_check_supports()
+
+    # Run gate
     files = [args.file] if args.file else None
-    report = run_gate(files=files)
-    print(report.format_slack())
-    if report.has_failures:
+    gate_report = run_gate(files=files)
+
+    # Run supports check
+    try:
+        supports_report = check_supports()
+    except Exception as e:
+        supports_report = None
+        supports_error = str(e)
+
+    if args.json:
+        result = {
+            "gate": gate_report.to_dict(),
+            "supports": supports_report.to_dict() if supports_report else {"error": supports_error},
+        }
+        if supports_report:
+            total = gate_report.total_claims + supports_report.checked_entries
+            verified = gate_report.passed + supports_report.healthy
+            result["coverage"] = {
+                "total_checked": total,
+                "verified_healthy": verified,
+                "percentage": round(verified / total * 100, 1) if total > 0 else 100.0,
+            }
+        print(json.dumps(result, indent=2))
+        if gate_report.has_failures or (supports_report and supports_report.has_zombies):
+            sys.exit(1)
+        return
+
+    if args.slack:
+        print(_format_health_slack(gate_report, supports_report))
+        if gate_report.has_failures or (supports_report and supports_report.has_zombies):
+            sys.exit(1)
+        return
+
+    # Terminal dashboard
+    print(_format_health_dashboard(gate_report, supports_report))
+    if gate_report.has_failures or (supports_report and supports_report.has_zombies):
         sys.exit(1)
+
+
+def _format_health_dashboard(gate_report, supports_report):
+    """Format a comprehensive terminal health dashboard."""
+    lines = []
+    lines.append("=" * 52)
+    lines.append("  CONFAB SYSTEM HEALTH REPORT")
+    lines.append("=" * 52)
+
+    # --- Claims section ---
+    lines.append("")
+    lines.append("CLAIMS")
+    lines.append(f"  Total: {gate_report.total_claims}  |  "
+                 f"Verified: {gate_report.passed}  |  "
+                 f"Failed: {gate_report.failed}  |  "
+                 f"Stale: {gate_report.stale_claims}")
+    lines.append(f"  Inconclusive: {gate_report.inconclusive}  |  "
+                 f"Skipped: {gate_report.skipped}")
+
+    if gate_report.auto_verified > 0:
+        claim_pct = gate_report.passed / gate_report.auto_verified * 100
+        lines.append(f"  Pass rate: {claim_pct:.0f}% ({gate_report.passed}/{gate_report.auto_verified} auto-verified)")
+    lines.append(f"  Files: {', '.join(gate_report.files_scanned) or '(none)'}")
+
+    if gate_report.has_failures:
+        lines.append("")
+        lines.append(f"  FAILURES ({gate_report.failed}):")
+        for d in gate_report.failed_details[:5]:
+            lines.append(f"    x  {d['claim_text'][:80]}")
+            ev = d['evidence'].split('\n')[0][:70]
+            lines.append(f"       {ev}")
+        if len(gate_report.failed_details) > 5:
+            lines.append(f"    ...and {len(gate_report.failed_details) - 5} more")
+
+    if gate_report.has_stale:
+        lines.append("")
+        lines.append(f"  STALE ({gate_report.stale_claims}):")
+        for d in gate_report.stale_details[:3]:
+            age = d.get('age_builds', '?')
+            lines.append(f"    ~  [{age} runs] {d['claim_text'][:70]}")
+        if len(gate_report.stale_details) > 3:
+            lines.append(f"    ...and {len(gate_report.stale_details) - 3} more")
+
+    # --- Supports section ---
+    lines.append("")
+    lines.append("-" * 52)
+    lines.append("")
+    lines.append("KNOWLEDGE TREE SUPPORTS")
+
+    if supports_report is None:
+        lines.append("  (unavailable — knowledge tree not found)")
+    else:
+        lines.append(f"  Entries checked: {supports_report.checked_entries}  |  "
+                     f"Zombies: {len(supports_report.zombies)}  |  "
+                     f"Weakened: {len(supports_report.weakened)}  |  "
+                     f"Healthy: {supports_report.healthy}")
+        lines.append(f"  No supports: {supports_report.no_supports}  |  "
+                     f"Invalidated: {supports_report.invalidated_count}  |  "
+                     f"Total tree: {supports_report.total_entries}")
+
+        if supports_report.zombies:
+            zombie_ids = [z.entry_id for z in supports_report.zombies[:10]]
+            lines.append(f"  Zombie IDs: {', '.join(zombie_ids)}"
+                         + (f" ...+{len(supports_report.zombies) - 10}" if len(supports_report.zombies) > 10 else ""))
+
+        if supports_report.weakened:
+            lines.append(f"  Weakened IDs: "
+                         + ", ".join(w.entry_id for w in supports_report.weakened[:5])
+                         + (f" ...+{len(supports_report.weakened) - 5}" if len(supports_report.weakened) > 5 else ""))
+
+    # --- Coverage section ---
+    lines.append("")
+    lines.append("-" * 52)
+    lines.append("")
+    lines.append("VERIFICATION COVERAGE")
+
+    if supports_report:
+        total = gate_report.total_claims + supports_report.checked_entries
+        verified = gate_report.passed + supports_report.healthy
+        pct = verified / total * 100 if total > 0 else 100.0
+        lines.append(f"  Claims verified: {gate_report.passed}/{gate_report.total_claims}")
+        lines.append(f"  Tree entries healthy: {supports_report.healthy}/{supports_report.checked_entries}")
+        lines.append(f"  Combined coverage: {pct:.1f}% ({verified}/{total})")
+    else:
+        if gate_report.total_claims > 0:
+            pct = gate_report.passed / gate_report.total_claims * 100
+            lines.append(f"  Claims verified: {gate_report.passed}/{gate_report.total_claims} ({pct:.0f}%)")
+        else:
+            lines.append(f"  No claims to verify")
+
+    # --- Overall status ---
+    lines.append("")
+    lines.append("=" * 52)
+
+    has_critical = gate_report.has_failures or (supports_report and supports_report.has_zombies)
+    has_warning = gate_report.has_stale or (supports_report and supports_report.has_issues and not supports_report.has_zombies)
+
+    if has_critical:
+        status = "CRITICAL"
+    elif has_warning:
+        status = "WARNING"
+    else:
+        status = "HEALTHY"
+
+    lines.append(f"  STATUS: {status}")
+    lines.append("=" * 52)
+
+    return "\n".join(lines)
+
+
+def _format_health_slack(gate_report, supports_report):
+    """Format a concise Slack-friendly health report."""
+    lines = []
+
+    # Gate status
+    if gate_report.clean:
+        lines.append(f":white_check_mark: Gate CLEAN — {gate_report.total_claims} claims, {gate_report.passed} verified")
+    else:
+        parts = []
+        if gate_report.failed > 0:
+            parts.append(f":x: {gate_report.failed} failed")
+        if gate_report.stale_claims > 0:
+            parts.append(f":hourglass: {gate_report.stale_claims} stale")
+        if gate_report.passed > 0:
+            parts.append(f":white_check_mark: {gate_report.passed} passed")
+        lines.append(" | ".join(parts))
+
+    # Supports status
+    if supports_report:
+        if not supports_report.has_issues:
+            lines.append(f":white_check_mark: Supports CLEAN — {supports_report.checked_entries} entries healthy")
+        else:
+            parts = []
+            if supports_report.zombies:
+                parts.append(f":skull: {len(supports_report.zombies)} zombie")
+            if supports_report.weakened:
+                parts.append(f":warning: {len(supports_report.weakened)} weakened")
+            parts.append(f":white_check_mark: {supports_report.healthy} healthy")
+            lines.append(" | ".join(parts))
+
+    # Coverage
+    if supports_report:
+        total = gate_report.total_claims + supports_report.checked_entries
+        verified = gate_report.passed + supports_report.healthy
+        pct = verified / total * 100 if total > 0 else 100.0
+        lines.append(f"Coverage: {pct:.0f}%")
+
+    return "\n".join(lines)
 
 
 def cmd_sweep(args):
@@ -402,8 +588,10 @@ Examples:
     prune_parser.add_argument("--verbose", "-v", action="store_true", help="Show dead file references")
 
     # report
-    report_parser = subparsers.add_parser("report", help="Concise Slack-friendly gate report")
+    report_parser = subparsers.add_parser("report", help="System health dashboard (gate + supports + coverage)")
     report_parser.add_argument("--file", "-f", help="Specific file to scan")
+    report_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    report_parser.add_argument("--slack", action="store_true", help="Concise Slack-friendly output")
 
     # sweep
     sweep_parser = subparsers.add_parser("sweep", help="Show tracked claims by staleness")

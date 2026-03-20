@@ -109,17 +109,36 @@ class ConfabConfig:
 
 
 def _detect_workspace_root() -> Path:
-    """Detect workspace root. Uses ia repo root if inside it, else cwd."""
+    """Detect workspace root.
+
+    Priority order:
+    1. If cwd has a confab.toml, use cwd (external project with config)
+    2. If running from within the ia repo, use the ia repo root
+    3. Otherwise use cwd
+    """
+    cwd = Path.cwd()
+    # If cwd has its own confab.toml, it's the workspace root
+    if (cwd / CONFIG_FILENAME).exists():
+        return cwd
+    # Check if running from within the ia repo
     module_dir = Path(__file__).resolve().parent
     candidate = module_dir.parent.parent  # core/confab -> core -> repo root
-    if (candidate / "core" / "confab" / "__init__.py").exists():
+    if _is_ia_repo(candidate):
         return candidate
-    return Path.cwd()
+    if _is_ia_repo(cwd):
+        return cwd
+    return cwd
 
 
 def _is_ia_repo(root: Path) -> bool:
-    """Check if the workspace root is the ia repository."""
-    return (root / "core" / "confab" / "__init__.py").exists()
+    """Check if a directory is the ia repository.
+
+    Looks for ia-specific markers (not just confab's own files).
+    """
+    return (
+        (root / "core" / "confab" / "__init__.py").exists()
+        and (root / "core" / "agents").is_dir()
+    )
 
 
 def load_config(
