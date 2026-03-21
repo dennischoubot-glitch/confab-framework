@@ -106,12 +106,29 @@ class TestConfigFromToml(unittest.TestCase):
         self.assertEqual(config.pipeline_names, {"build pipeline": "build.py"})
         self.assertEqual(config.known_env_vars, {"MY_API_KEY", "MY_SECRET"})
 
+    def test_exclude_sections_from_toml(self):
+        data = {
+            "confab": {
+                "files_to_scan": ["a.md"],
+                "exclude_sections": [
+                    "Germinating threads",
+                    "For Next Dreamer",
+                ],
+            }
+        }
+        config = _config_from_toml(data, Path("/tmp"))
+        self.assertEqual(config.exclude_sections, [
+            "Germinating threads",
+            "For Next Dreamer",
+        ])
+
     def test_minimal_config(self):
         data = {"confab": {}}
         config = _config_from_toml(data, Path("/tmp"))
         self.assertEqual(config.files_to_scan, [])
         self.assertEqual(config.stale_threshold, 3)
         self.assertEqual(config.known_env_vars, set())
+        self.assertEqual(config.exclude_sections, [])
 
     def test_empty_toml(self):
         data = {}

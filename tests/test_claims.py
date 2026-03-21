@@ -306,6 +306,150 @@ class TestExtractClaims(unittest.TestCase):
         self.assertEqual(extract_claims("Hello world, nothing to check here"), [])
 
 
+class TestSectionExclusion(unittest.TestCase):
+    """Test section-aware claim extraction filtering."""
+
+    def test_excluded_section_skipped(self):
+        """Claims in excluded sections should not be extracted."""
+        text = (
+            "## System Status\n"
+            "Script `deploy.py` is working\n"
+            "\n"
+            "### Germinating threads\n"
+            "**The Gain Controller** (idea-614) — Sustained 2 sessions. Crystalline.\n"
+            "Script `broken.py` is broken\n"
+            "\n"
+            "## Next Steps\n"
+            "Script `build.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=["Germinating threads"])
+        claim_texts = [c.text for c in claims]
+        # Should have claims from System Status and Next Steps, not Germinating threads
+        self.assertTrue(any("deploy.py" in t for t in claim_texts))
+        self.assertTrue(any("build.py" in t for t in claim_texts))
+        self.assertFalse(any("broken.py" in t for t in claim_texts))
+        self.assertFalse(any("Gain Controller" in t for t in claim_texts))
+
+    def test_exclusion_ends_at_same_level_heading(self):
+        """Exclusion should end when a heading at the same or higher level appears."""
+        text = (
+            "### Germinating threads\n"
+            "Script `excluded.py` is broken\n"
+            "\n"
+            "### Active items\n"
+            "Script `included.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=["Germinating threads"])
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("excluded.py" in t for t in claim_texts))
+        self.assertTrue(any("included.py" in t for t in claim_texts))
+
+    def test_exclusion_ends_at_higher_level_heading(self):
+        """A higher-level heading should also end the exclusion."""
+        text = (
+            "### Germinating threads\n"
+            "Script `excluded.py` is broken\n"
+            "\n"
+            "## Top Level Section\n"
+            "Script `included.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=["Germinating threads"])
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("excluded.py" in t for t in claim_texts))
+        self.assertTrue(any("included.py" in t for t in claim_texts))
+
+    def test_deeper_subheading_stays_excluded(self):
+        """A deeper heading within an excluded section should stay excluded."""
+        text = (
+            "### Germinating threads\n"
+            "#### Sub-thread A\n"
+            "Script `still_excluded.py` is broken\n"
+            "\n"
+            "### Active items\n"
+            "Script `included.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=["Germinating threads"])
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("still_excluded.py" in t for t in claim_texts))
+        self.assertTrue(any("included.py" in t for t in claim_texts))
+
+    def test_multiple_exclusion_patterns(self):
+        """Multiple exclusion patterns should all be applied."""
+        text = (
+            "### Germinating threads\n"
+            "Script `germ.py` is broken\n"
+            "### For Next Dreamer\n"
+            "Script `dreamer.py` is broken\n"
+            "### Active items\n"
+            "Script `active.py` is running\n"
+        )
+        claims = extract_claims(
+            text,
+            exclude_sections=["Germinating threads", "For Next Dreamer"],
+        )
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("germ.py" in t for t in claim_texts))
+        self.assertFalse(any("dreamer.py" in t for t in claim_texts))
+        self.assertTrue(any("active.py" in t for t in claim_texts))
+
+    def test_regex_pattern_matching(self):
+        """Exclusion patterns should support regex."""
+        text = (
+            "### Germinating threads (do not rush)\n"
+            "Script `excluded.py` is broken\n"
+            "### Active items\n"
+            "Script `included.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=[r"Germinating threads"])
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("excluded.py" in t for t in claim_texts))
+        self.assertTrue(any("included.py" in t for t in claim_texts))
+
+    def test_case_insensitive_matching(self):
+        """Exclusion patterns should be case-insensitive."""
+        text = (
+            "### GERMINATING THREADS\n"
+            "Script `excluded.py` is broken\n"
+            "### Active items\n"
+            "Script `included.py` is running\n"
+        )
+        claims = extract_claims(text, exclude_sections=["germinating threads"])
+        claim_texts = [c.text for c in claims]
+        self.assertFalse(any("excluded.py" in t for t in claim_texts))
+
+    def test_empty_exclusion_list(self):
+        """Empty exclusion list should not exclude anything."""
+        text = (
+            "### Germinating threads\n"
+            "Script `germ.py` is broken\n"
+        )
+        claims = extract_claims(text, exclude_sections=[])
+        claim_texts = [c.text for c in claims]
+        self.assertTrue(any("germ.py" in t for t in claim_texts))
+
+    def test_real_dreamer_false_positive(self):
+        """The actual false positive case: germinating thread notes flagged as claims."""
+        text = (
+            "### Germinating threads (do not rush)\n"
+            "- **The Gain Controller** (idea-614) — Sustained 2 sessions. Crystalline...\n"
+            "- **The River Measurement** (idea-603) — Sustained 2 sessions.\n"
+            "\n"
+            "## System Status\n"
+            "- **Audio WORKS** — [v2: confirmed Mar 13]\n"
+            "- Notes pipeline operational. [v1: verified 2026-03-19]\n"
+        )
+        claims = extract_claims(
+            text,
+            exclude_sections=["Germinating threads"],
+        )
+        claim_texts = [c.text for c in claims]
+        # Germinating thread notes should NOT appear
+        self.assertFalse(any("Gain Controller" in t for t in claim_texts))
+        self.assertFalse(any("River Measurement" in t for t in claim_texts))
+        # System Status claims SHOULD appear
+        self.assertTrue(any("pipeline" in t.lower() for t in claim_texts))
+
+
 class TestExtractClaimsFromFile(unittest.TestCase):
     """Test file-based claim extraction."""
 

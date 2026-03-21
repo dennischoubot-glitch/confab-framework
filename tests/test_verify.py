@@ -17,6 +17,7 @@ from confab.verify import (
     verify_env_var,
     verify_script_syntax,
     verify_config_present,
+    verify_registry,
     verify_claim,
     verify_all,
     summarize_outcomes,
@@ -234,6 +235,44 @@ class TestCheckKeyInData(unittest.TestCase):
 
     def test_intermediate_non_dict(self):
         self.assertFalse(_check_key_in_data({"a": "string"}, "a.b"))
+
+
+class TestVerifyRegistry(unittest.TestCase):
+    """Test registry verification."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        core_dir = Path(self.tmpdir) / "core"
+        core_dir.mkdir()
+        (core_dir / "SYSTEM_REGISTRY.md").write_text(
+            "# System Registry\n\n"
+            "| Path | Purpose | Status |\n"
+            "| `kalshi_market_data.db` | Market data | canonical |\n"
+            "| `scripts/kalshi_portfolio.py` | Portfolio | canonical |\n"
+        )
+        set_config(ConfabConfig(workspace_root=Path(self.tmpdir), files_to_scan=[]))
+
+    def tearDown(self):
+        reset_config()
+
+    def test_registered_file_passes(self):
+        outcome = verify_registry(["kalshi_market_data.db"])
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
+
+    def test_unregistered_file_fails(self):
+        outcome = verify_registry(["orphan_data.db"])
+        self.assertEqual(outcome.result, VerificationResult.FAILED)
+        self.assertIn("NOT in SYSTEM_REGISTRY.md", outcome.evidence)
+
+    def test_mixed_registered_and_unregistered(self):
+        outcome = verify_registry(["kalshi_market_data.db", "unknown.db"])
+        self.assertEqual(outcome.result, VerificationResult.FAILED)
+
+    def test_no_registry_file(self):
+        import os
+        os.remove(str(Path(self.tmpdir) / "core" / "SYSTEM_REGISTRY.md"))
+        outcome = verify_registry(["anything.db"])
+        self.assertEqual(outcome.result, VerificationResult.INCONCLUSIVE)
 
 
 class TestVerifyClaim(unittest.TestCase):

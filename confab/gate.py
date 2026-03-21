@@ -18,7 +18,7 @@ bits at the point where cascade propagation happens.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from .claims import (
     Claim,
     ClaimType,
+    FILE_PATH_RE,
     VerifiabilityLevel,
     extract_claims,
     extract_claims_from_file,
@@ -65,6 +66,7 @@ class GateReport:
     failed_details: List[Dict[str, Any]]
     stale_details: List[Dict[str, Any]]
     all_outcomes: List[VerificationOutcome]
+    registry_violations: List[Dict[str, Any]] = field(default_factory=list)
     # Tracker metadata (populated when tracker is enabled)
     tracker_new: int = 0           # Claims seen for the first time
     tracker_returning: int = 0     # Claims seen before
@@ -79,8 +81,12 @@ class GateReport:
         return self.stale_claims > 0
 
     @property
+    def has_registry_violations(self) -> bool:
+        return len(self.registry_violations) > 0
+
+    @property
     def clean(self) -> bool:
-        return not self.has_failures and not self.has_stale
+        return not self.has_failures and not self.has_stale and not self.has_registry_violations
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -93,6 +99,7 @@ class GateReport:
             "inconclusive": self.inconclusive,
             "skipped": self.skipped,
             "stale_claims": self.stale_claims,
+            "registry_violations": self.registry_violations,
             "clean": self.clean,
             "failed_details": self.failed_details,
             "stale_details": self.stale_details,
@@ -139,6 +146,17 @@ class GateReport:
                 lines.append(f"  Action: Verify or delete before propagating.")
                 lines.append("")
 
+        if self.has_registry_violations:
+            lines.append(f"\n## REGISTRY VIOLATIONS ({len(self.registry_violations)})")
+            lines.append("")
+            lines.append("These files are referenced but not in SYSTEM_REGISTRY.md:")
+            lines.append("")
+            for v in self.registry_violations:
+                lines.append(f"**File:** `{v['path']}`")
+                lines.append(f"  Source: {v.get('source_file', '?')}:{v.get('source_line', '?')}")
+                lines.append(f"  Action: {v['action']}")
+                lines.append("")
+
         # Summary
         passed_pct = (self.passed / self.auto_verified * 100) if self.auto_verified > 0 else 0
         lines.append("## Summary")
@@ -146,6 +164,7 @@ class GateReport:
         lines.append(f"- Failed: {self.failed}")
         lines.append(f"- Inconclusive: {self.inconclusive}")
         lines.append(f"- Stale: {self.stale_claims}")
+        lines.append(f"- Registry violations: {len(self.registry_violations)}")
         lines.append(f"- Manual: {self.skipped}")
 
         # Tracker info
@@ -176,6 +195,8 @@ class GateReport:
             status_parts.append(f":x: {self.failed} FAILED")
         if self.stale_claims > 0:
             status_parts.append(f":hourglass: {self.stale_claims} stale")
+        if self.has_registry_violations:
+            status_parts.append(f":warning: {len(self.registry_violations)} registry")
         if self.passed > 0:
             status_parts.append(f":white_check_mark: {self.passed} passed")
 
@@ -202,6 +223,15 @@ class GateReport:
             remaining = len(self.stale_details) - len(shown)
             if remaining > 0:
                 lines.append(f"  ...and {remaining} more stale claims")
+
+        # Registry violations (compact)
+        if self.has_registry_violations:
+            lines.append("")
+            for v in self.registry_violations[:3]:
+                lines.append(f":warning: REGISTRY: `{v['path']}` not registered")
+            remaining = len(self.registry_violations) - 3
+            if remaining > 0:
+                lines.append(f"  ...and {remaining} more registry violations")
 
         # Tracker
         if self.tracker_total_runs > 0:
@@ -329,6 +359,9 @@ def run_gate(
         stats = get_stats()
         tracker_total_runs = stats["total_gate_runs"]
 
+    # Registry enforcement: scan all file references and check against SYSTEM_REGISTRY.md
+    registry_violations = _check_registry(files, text, config)
+
     # Count results
     result_counts = {}
     for o in outcomes:
@@ -349,6 +382,7 @@ def run_gate(
         failed_details=failed_details,
         stale_details=stale_details,
         all_outcomes=outcomes,
+        registry_violations=registry_violations,
         tracker_new=tracker_new,
         tracker_returning=tracker_returning,
         tracker_total_runs=tracker_total_runs,
@@ -381,6 +415,134 @@ def _suggest_action(outcome: VerificationOutcome) -> str:
         return "Config file missing, invalid, or missing expected keys. Check the file and update the claim."
 
     return "Claim contradicts evidence. Investigate and correct."
+
+
+# Extensions to check (registrable shared resources)
+_REGISTRY_EXTENSIONS = {'.db', '.json', '.py'}
+
+# Paths to skip during registry checks (framework internals, non-shared files)
+_REGISTRY_SKIP_PREFIXES = (
+    'core/confab/',       # The framework itself
+    'core/agents/',       # Agent prompt/config files
+    'tests/',             # Test files
+    '.claude/',           # Claude config
+    'node_modules/',      # Dependencies
+)
+
+_REGISTRY_SKIP_BASENAMES = {
+    'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.node.json',
+    'wrangler.json', 'wrangler.jsonc', '.eslintrc.json', 'babel.config.json',
+    '__init__.py', 'conftest.py', 'setup.py', 'pyproject.toml',
+}
+
+
+def _check_registry(
+    files: Optional[List[str]],
+    text: Optional[str],
+    config: "ConfabConfig",
+) -> List[Dict[str, Any]]:
+    """Scan scanned files for .db/.json/.py references and check against SYSTEM_REGISTRY.md.
+
+    Returns a list of registry violation dicts with path, source_file, source_line, action.
+    """
+    from .verify import verify_registry
+
+    registry_path = config.workspace_root / "core" / "SYSTEM_REGISTRY.md"
+    if not registry_path.exists():
+        return []  # No registry to check against
+
+    registry_text = registry_path.read_text()
+
+    # Collect all file references from scanned files
+    file_refs: List[Dict[str, Any]] = []  # {path, source_file, source_line}
+
+    if files:
+        for file_path in files:
+            resolved = Path(file_path)
+            if not resolved.is_absolute():
+                resolved = config.workspace_root / file_path
+            if not resolved.exists():
+                continue
+            try:
+                source_rel = str(resolved.relative_to(config.workspace_root))
+            except ValueError:
+                source_rel = str(resolved)
+
+            content = resolved.read_text()
+            for line_num, line in enumerate(content.split('\n'), 1):
+                for match in FILE_PATH_RE.finditer(line):
+                    path = match.group(1) or match.group(2)
+                    if path:
+                        file_refs.append({
+                            'path': path,
+                            'source_file': source_rel,
+                            'source_line': line_num,
+                        })
+
+    if text:
+        for line_num, line in enumerate(text.split('\n'), 1):
+            for match in FILE_PATH_RE.finditer(line):
+                path = match.group(1) or match.group(2)
+                if path:
+                    file_refs.append({
+                        'path': path,
+                        'source_file': '<inline>',
+                        'source_line': line_num,
+                    })
+
+    # Filter to registrable extensions and deduplicate
+    seen = set()
+    violations = []
+
+    for ref in file_refs:
+        path_str = ref['path']
+        ext = Path(path_str).suffix.lower()
+
+        # Only check registrable file types
+        if ext not in _REGISTRY_EXTENSIONS:
+            continue
+
+        # Skip already-seen paths
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+
+        # Skip framework internals and non-shared files
+        if any(path_str.startswith(pfx) for pfx in _REGISTRY_SKIP_PREFIXES):
+            continue
+
+        basename = Path(path_str).name
+        if basename in _REGISTRY_SKIP_BASENAMES:
+            continue
+
+        # Skip test files (test_*.py)
+        if basename.startswith('test_') and ext == '.py':
+            continue
+
+        # Check if in registry (both full path and basename)
+        in_registry = (
+            f"`{path_str}`" in registry_text
+            or f"`{basename}`" in registry_text
+            or path_str in registry_text
+        )
+
+        if not in_registry:
+            # Determine suggested action based on file type
+            if ext == '.db':
+                action = "Register in SYSTEM_REGISTRY.md or consolidate into an existing database."
+            elif ext == '.json':
+                action = "Register in SYSTEM_REGISTRY.md or use an existing JSON data file."
+            else:  # .py
+                action = "Register in SYSTEM_REGISTRY.md if this is a shared script."
+
+            violations.append({
+                'path': path_str,
+                'source_file': ref['source_file'],
+                'source_line': ref['source_line'],
+                'action': action,
+            })
+
+    return violations
 
 
 class ConfabGate:

@@ -7,12 +7,19 @@ This is a read-only diagnostic. It doesn't modify the tree — the dreamer
 decides what to invalidate. It surfaces the structural debt so the dreamer
 can act on it.
 
+IMPORTANT: Ideas don't need observations to remain valid. Observations are
+fleeting facts; ideas are durable patterns that outlive their source evidence.
+An idea with all-dead observation supports is NOT a zombie — it's normal
+lifecycle. Ideas are only flagged as zombie/weakened when their non-observation
+supports (other ideas, principles) are dead. (Dennis directive, Mar 20 2026)
+
 Motivated by idea-489 (The Firewall): the tree's type hierarchy blocks
 upward invalidation. Observations get invalidated but ideas standing on
 those observations persist indefinitely.
 """
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +30,7 @@ DEFAULT_TREE_PATH = "core/knowledge/KNOWLEDGE_TREE.json"
 
 # Entry types that have supports pointing downward
 SUPPORTED_TYPES = {"idea", "principle", "truth"}
+
 
 
 @dataclass
@@ -36,21 +44,26 @@ class WeakEntry:
     dead_supports: int
     dead_ids: List[str]
     missing_ids: List[str]  # supports referencing non-existent entries
+    # Effective counts for zombie/weakened classification.
+    # For ideas, these exclude dead observation supports (observations are fleeting).
+    # For principles/truths, these equal the raw counts.
+    effective_dead: int = 0
+    effective_total: int = 0
 
     @property
     def dead_ratio(self) -> float:
-        if self.total_supports == 0:
+        if self.effective_total == 0:
             return 0.0
-        return (self.dead_supports + len(self.missing_ids)) / self.total_supports
+        return self.effective_dead / self.effective_total
 
     @property
     def is_zombie(self) -> bool:
-        """All supports are dead or missing."""
-        return self.total_supports > 0 and (self.dead_supports + len(self.missing_ids)) >= self.total_supports
+        """All effective supports are dead or missing."""
+        return self.effective_total > 0 and self.effective_dead >= self.effective_total
 
     @property
     def is_weakened(self) -> bool:
-        """More than 50% of supports are dead or missing, but not all."""
+        """More than 50% of effective supports are dead or missing, but not all."""
         return not self.is_zombie and self.dead_ratio > 0.5
 
     def to_dict(self) -> Dict[str, Any]:
@@ -62,6 +75,8 @@ class WeakEntry:
             "total_supports": self.total_supports,
             "dead_supports": self.dead_supports,
             "missing_supports": len(self.missing_ids),
+            "effective_dead": self.effective_dead,
+            "effective_total": self.effective_total,
             "dead_ratio": round(self.dead_ratio, 3),
             "zombie": self.is_zombie,
             "dead_ids": self.dead_ids,
@@ -135,7 +150,12 @@ class SupportsReport:
                     lines.append(f"  Dead: {', '.join(z.dead_ids[:5])}{' ...' if len(z.dead_ids) > 5 else ''}")
                 if z.missing_ids:
                     lines.append(f"  Missing: {', '.join(z.missing_ids[:5])}{' ...' if len(z.missing_ids) > 5 else ''}")
+                lines.append(f"  Fix: `python core/knowledge.py invalidate {z.entry_id} --reason \"All supports dead\"`")
                 lines.append("")
+
+            lines.append(f"Auto-fix all: `confab check-supports --fix`")
+            lines.append(f"Preview first: `confab check-supports --fix --dry-run`")
+            lines.append("")
 
         if self.weakened:
             lines.append(f"\n## WEAKENED ENTRIES ({len(self.weakened)})")
@@ -195,6 +215,15 @@ class SupportsReport:
                 lines.append(f"  ...and {len(self.zombies) - 5} more zombies")
 
         return "\n".join(lines)
+
+
+def _looks_like_observation(entry_id: str) -> bool:
+    """Heuristic: does this ID look like an observation?
+
+    Handles standard (obs-NNN) and legacy prefixed (sc-obs-NNN, ph-obs-NNN) formats.
+    Used when the entry doesn't exist in the tree and we need to infer type from ID.
+    """
+    return bool(re.search(r"obs-\d+", entry_id))
 
 
 def check_supports(
@@ -262,6 +291,26 @@ def check_supports(
         missing_ids = [s for s in supports if s not in all_node_ids]
         dead_count = len(dead_ids)
 
+        # For ideas: observations are fleeting — dead obs supports are normal
+        # lifecycle, not structural debt. Only count non-observation dead
+        # supports for zombie/weakened classification.
+        # Missing entries with observation-like IDs (obs-NNN, sc-obs-NNN)
+        # are treated as missing observations — also excluded.
+        if entry_type == "idea":
+            non_obs_dead = [s for s in dead_ids
+                           if nodes.get(s, {}).get("type") != "observation"]
+            non_obs_missing = [s for s in missing_ids
+                               if not _looks_like_observation(s)]
+            effective_dead = len(non_obs_dead) + len(non_obs_missing)
+            non_obs_supports = [s for s in supports
+                                if nodes.get(s, {}).get("type", "observation") != "observation"
+                                and s not in missing_ids]
+            # Add back non-obs missing (they count as supports we need to track)
+            effective_total = len(non_obs_supports) + len(non_obs_missing)
+        else:
+            effective_dead = dead_count + len(missing_ids)
+            effective_total = len(supports)
+
         domain = entry.get("domain", "unset") or "unset"
 
         # Initialize type/domain counters
@@ -282,6 +331,8 @@ def check_supports(
             dead_supports=dead_count,
             dead_ids=dead_ids,
             missing_ids=missing_ids,
+            effective_dead=effective_dead,
+            effective_total=effective_total,
         )
 
         if weak.is_zombie:
@@ -315,3 +366,62 @@ def check_supports(
         by_type=by_type,
         by_domain=by_domain,
     )
+
+
+def fix_zombies(
+    tree_path: Optional[str] = None,
+    workspace_root: Optional[Path] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Auto-invalidate zombie entries where ALL supports are dead.
+
+    Args:
+        tree_path: Path to KNOWLEDGE_TREE.json.
+        workspace_root: Workspace root for resolving relative paths.
+        dry_run: If True, report what would be fixed without modifying the tree.
+
+    Returns:
+        Dict with 'fixed' (list of invalidated IDs) and 'report' (SupportsReport).
+    """
+    report = check_supports(tree_path=tree_path, workspace_root=workspace_root)
+
+    if not report.zombies:
+        return {"fixed": [], "skipped": [], "report": report}
+
+    if workspace_root is None:
+        try:
+            from .config import get_config
+            workspace_root = get_config().workspace_root
+        except Exception:
+            workspace_root = Path.cwd()
+
+    resolved = Path(report.tree_path)
+    tree_data = json.loads(resolved.read_text())
+    nodes = tree_data.get("nodes", {})
+
+    fixed = []
+    skipped = []
+
+    for zombie in report.zombies:
+        entry = nodes.get(zombie.entry_id)
+        if not entry:
+            skipped.append(zombie.entry_id)
+            continue
+
+        if dry_run:
+            fixed.append(zombie.entry_id)
+            continue
+
+        # Invalidate the entry
+        entry["status"] = "invalidated"
+        entry["invalidated_reason"] = (
+            f"Auto-invalidated by supports checker: all {zombie.effective_total} "
+            f"effective supports are dead or missing "
+            f"({zombie.dead_supports} invalidated, {len(zombie.missing_ids)} missing)."
+        )
+        fixed.append(zombie.entry_id)
+
+    if not dry_run and fixed:
+        resolved.write_text(json.dumps(tree_data, indent=2, ensure_ascii=False) + "\n")
+
+    return {"fixed": fixed, "skipped": skipped, "report": report}

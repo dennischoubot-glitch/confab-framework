@@ -30,6 +30,7 @@ class ClaimType(Enum):
     COUNT_CLAIM = "count_claim"          # "X entries / N items / count of Y"
     STATUS_CLAIM = "status_claim"        # general status assertions
     FACT_CLAIM = "fact_claim"            # factual claims (dates, numbers)
+    REGISTRY_VIOLATION = "registry_violation"  # file/db not in SYSTEM_REGISTRY.md
     SUBJECTIVE = "subjective"            # opinions, assessments
 
 
@@ -178,9 +179,24 @@ OPTIONAL_FILE_RE = re.compile(
 # Claim extraction
 # ---------------------------------------------------------------------------
 
+def _get_exclude_patterns() -> List[re.Pattern]:
+    """Load section exclusion patterns from config."""
+    try:
+        from .config import get_config
+        patterns = get_config().exclude_sections
+    except Exception:
+        patterns = []
+    return [re.compile(p, re.IGNORECASE) for p in patterns] if patterns else []
+
+
+# Markdown heading pattern for section tracking
+_HEADING_RE = re.compile(r'^(#{1,6})\s+(.+)')
+
+
 def extract_claims(
     text: str,
     source_file: Optional[str] = None,
+    exclude_sections: Optional[List[str]] = None,
 ) -> List[Claim]:
     """Extract verifiable claims from agent text.
 
@@ -192,10 +208,26 @@ def extract_claims(
     - Count/quantity claims
     - General status claims with verification tags
 
+    Args:
+        text: The text to scan for claims.
+        source_file: Path to the source file (for reporting).
+        exclude_sections: Optional list of regex patterns for section headings
+            to skip during extraction. If None, loads from config.
+
     Returns a list of Claim objects, sorted by verifiability (auto first).
     """
     claims = []
     lines = text.split('\n')
+
+    # Build section exclusion patterns
+    if exclude_sections is not None:
+        excl_patterns = [re.compile(p, re.IGNORECASE) for p in exclude_sections]
+    else:
+        excl_patterns = _get_exclude_patterns()
+
+    # Track which section we're in for exclusion filtering
+    in_excluded_section = False
+    excluded_heading_level = 0  # depth of the heading that started the exclusion
 
     # Track build sections for age estimation
     build_sections = list(BUILD_HEADER_RE.finditer(text))
@@ -207,8 +239,32 @@ def extract_claims(
             if m.start() <= sum(len(l) + 1 for l in lines[:line_num - 1]):
                 current_build_idx = i
 
-        # Skip headers, empty lines, and table formatting
+        # Check if this line is a heading — update section tracking
         stripped = line.strip()
+        heading_match = _HEADING_RE.match(stripped)
+        if heading_match:
+            heading_level = len(heading_match.group(1))
+            heading_text = heading_match.group(2).strip()
+
+            if in_excluded_section:
+                # A heading at the same or higher level ends the exclusion
+                if heading_level <= excluded_heading_level:
+                    in_excluded_section = False
+                    # Fall through to check if THIS heading starts a new exclusion
+
+            if not in_excluded_section:
+                # Check if this heading matches an exclusion pattern
+                for pattern in excl_patterns:
+                    if pattern.search(heading_text):
+                        in_excluded_section = True
+                        excluded_heading_level = heading_level
+                        break
+
+        # Skip lines in excluded sections
+        if in_excluded_section:
+            continue
+
+        # Skip headers, empty lines, and table formatting
         if not stripped or stripped.startswith('#') or stripped.startswith('|---'):
             continue
 
@@ -467,13 +523,16 @@ def _classify_status_claim(
     )
 
 
-def extract_claims_from_file(file_path: str) -> List[Claim]:
+def extract_claims_from_file(
+    file_path: str,
+    exclude_sections: Optional[List[str]] = None,
+) -> List[Claim]:
     """Extract claims from a file on disk."""
     path = Path(file_path)
     if not path.exists():
         return []
     text = path.read_text()
-    return extract_claims(text, source_file=str(path))
+    return extract_claims(text, source_file=str(path), exclude_sections=exclude_sections)
 
 
 def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:

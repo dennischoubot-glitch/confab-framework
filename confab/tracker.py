@@ -144,6 +144,29 @@ def _get_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
             returning_claims INTEGER
         )
     """)
+    # Cascade history — per-run claim appearances for lineage tracing.
+    # Each row records that a specific claim appeared in a specific gate run
+    # with a specific status. This is the data needed to measure cascade depth
+    # (how many runs a false claim survived before being caught).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cascade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_hash TEXT NOT NULL,
+            gate_run_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            source_file TEXT,
+            FOREIGN KEY (claim_hash) REFERENCES tracked_claims(claim_hash),
+            FOREIGN KEY (gate_run_id) REFERENCES gate_runs(id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cascade_claim
+        ON cascade_history(claim_hash)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_cascade_run
+        ON cascade_history(gate_run_id)
+    """)
     conn.commit()
     return conn
 
@@ -248,7 +271,7 @@ def record_gate_run(
             returning_count += 1
 
     # Record the gate run
-    conn.execute("""
+    cursor = conn.execute("""
         INSERT INTO gate_runs
             (timestamp, files_scanned, total_claims, passed, failed,
              stale, new_claims, returning_claims)
@@ -258,6 +281,21 @@ def record_gate_run(
         passed_count, failed_count, stale_count,
         new_count, returning_count,
     ))
+    gate_run_id = cursor.lastrowid
+
+    # Record cascade history — one row per claim per run
+    for claim in claims:
+        h = _hash_claim(claim.text)
+        # Look up the current status for this claim
+        row = conn.execute(
+            "SELECT status FROM tracked_claims WHERE claim_hash = ?", (h,)
+        ).fetchone()
+        claim_status = row["status"] if row else "unknown"
+        conn.execute("""
+            INSERT INTO cascade_history
+                (claim_hash, gate_run_id, status, source_file)
+            VALUES (?, ?, ?, ?)
+        """, (h, gate_run_id, claim_status, claim.source_file))
 
     conn.commit()
     conn.close()
@@ -378,6 +416,162 @@ def get_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
         "by_status": by_status,
         "total_gate_runs": run_count,
         "latest_run": latest_run["timestamp"] if latest_run else None,
+    }
+
+
+@dataclass
+class CascadeEntry:
+    """A single point in a claim's cascade history."""
+    gate_run_id: int
+    timestamp: str
+    status: str
+    source_file: Optional[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.gate_run_id,
+            "timestamp": self.timestamp,
+            "status": self.status,
+            "source": self.source_file,
+        }
+
+
+def get_cascade_history(
+    claim_hash: str,
+    db_path: Optional[Path] = None,
+) -> List[CascadeEntry]:
+    """Get the full cascade history for a claim — every gate run it appeared in."""
+    conn = _get_db(db_path)
+    rows = conn.execute("""
+        SELECT ch.gate_run_id, gr.timestamp, ch.status, ch.source_file
+        FROM cascade_history ch
+        JOIN gate_runs gr ON ch.gate_run_id = gr.id
+        WHERE ch.claim_hash = ?
+        ORDER BY gr.id ASC
+    """, (claim_hash,)).fetchall()
+    conn.close()
+    return [
+        CascadeEntry(
+            gate_run_id=r["gate_run_id"],
+            timestamp=r["timestamp"],
+            status=r["status"],
+            source_file=r["source_file"],
+        )
+        for r in rows
+    ]
+
+
+def get_cascade_stats(
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compute cascade depth statistics across all tracked claims.
+
+    Returns:
+        Dict with avg_depth, max_depth, total_cascaded, resolved_count,
+        avg_time_to_resolution, and top_cascaders.
+    """
+    conn = _get_db(db_path)
+
+    # Get cascade depth (number of runs) per claim
+    rows = conn.execute("""
+        SELECT
+            ch.claim_hash,
+            tc.claim_text,
+            tc.status,
+            tc.first_seen,
+            tc.last_seen,
+            COUNT(ch.id) as depth
+        FROM cascade_history ch
+        JOIN tracked_claims tc ON ch.claim_hash = tc.claim_hash
+        GROUP BY ch.claim_hash
+        ORDER BY depth DESC
+    """).fetchall()
+
+    if not rows:
+        conn.close()
+        return {
+            "avg_depth": 0.0,
+            "max_depth": 0,
+            "total_cascaded": 0,
+            "resolved_count": 0,
+            "total_tracked": 0,
+            "top_cascaders": [],
+        }
+
+    depths = [r["depth"] for r in rows]
+    avg_depth = sum(depths) / len(depths)
+    max_depth = max(depths)
+
+    # Claims that cascaded (appeared 2+ times)
+    cascaded = [r for r in rows if r["depth"] >= 2]
+
+    # Claims that were eventually resolved (verified or expired)
+    resolved = [r for r in rows if r["status"] in ("verified", "expired")]
+
+    # Top cascaders (deepest propagation)
+    top = []
+    for r in rows[:10]:
+        top.append({
+            "hash": r["claim_hash"],
+            "text": r["claim_text"][:100],
+            "depth": r["depth"],
+            "status": r["status"],
+            "first_seen": r["first_seen"],
+            "last_seen": r["last_seen"],
+        })
+
+    conn.close()
+
+    return {
+        "avg_depth": round(avg_depth, 1),
+        "max_depth": max_depth,
+        "total_cascaded": len(cascaded),
+        "resolved_count": len(resolved),
+        "total_tracked": len(rows),
+        "top_cascaders": top,
+    }
+
+
+def trace_claim(
+    search_text: str,
+    db_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Trace a claim by searching for it in tracked claims.
+
+    Args:
+        search_text: Substring to search for in claim text.
+
+    Returns:
+        Dict with claim info and cascade history, or None if not found.
+    """
+    conn = _get_db(db_path)
+
+    # Search by hash first (exact), then by substring
+    row = conn.execute(
+        "SELECT * FROM tracked_claims WHERE claim_hash = ?",
+        (search_text,)
+    ).fetchone()
+
+    if row is None:
+        # Substring search
+        row = conn.execute(
+            "SELECT * FROM tracked_claims WHERE claim_text LIKE ? LIMIT 1",
+            (f"%{search_text}%",)
+        ).fetchone()
+
+    if row is None:
+        conn.close()
+        return None
+
+    claim = _row_to_tracked(row)
+    conn.close()
+
+    history = get_cascade_history(claim.claim_hash, db_path)
+
+    return {
+        "claim": claim.to_dict(),
+        "cascade": [e.to_dict() for e in history],
+        "cascade_depth": len(history),
     }
 
 

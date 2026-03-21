@@ -83,12 +83,20 @@ def _resolve_path(path_str: str) -> Path:
 
     # Only search subdirectories for bare filenames (no directory component)
     if '/' not in path_str and '\\' not in path_str:
-        skip = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.mypy_cache'}
-        for child in sorted(root.iterdir()):
-            if child.is_dir() and child.name not in skip and not child.name.startswith('.'):
-                candidate = child / path_str
-                if candidate.exists():
-                    return candidate
+        skip = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.mypy_cache',
+                '.egg-info', '.tox', '.pytest_cache'}
+        matches = list(root.rglob(path_str))
+        # Filter out matches inside skipped directories
+        matches = [
+            m for m in matches
+            if not any(part in skip or part.startswith('.') for part in m.relative_to(root).parts[:-1])
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            # Multiple matches — return first but caller should handle ambiguity
+            # Log for debugging: multiple candidates found
+            return matches[0]
 
     # Return the direct path even if it doesn't exist (caller checks existence)
     return direct
@@ -704,11 +712,32 @@ def _verify_regex_count(
         matches = re.findall(pattern, content, re.MULTILINE)
         match_count = len(matches)
 
-        claimed_number = int(claim.extracted_numbers[0])
+        # Subtract already-posted items if a posted_file is configured
+        posted_file = source_cfg.get("posted_file")
+        if posted_file:
+            posted_path = root / posted_file
+            if posted_path.exists():
+                posted_count = len([
+                    line for line in posted_path.read_text().strip().splitlines()
+                    if line.strip()
+                ])
+                match_count = max(0, match_count - posted_count)
+
+        # Detect "X total, Y remaining" claims — compare remaining against
+        # the subtracted count, and total against the raw count.
+        claim_lower = claim.text.lower()
+        total_raw = len(matches)  # before subtracting posted
+        remaining_match = re.search(
+            r'(\d+)\s+remaining', claim_lower,
+        )
+        total_match = re.search(
+            r'(\d+)\s+total', claim_lower,
+        )
 
         # Runway/days estimate using configured rate
         rate = source_cfg.get("rate_per_day")
-        if rate and ("runway" in claim.text.lower() or "days" in claim.text.lower()):
+        if rate and ("runway" in claim_lower or "days" in claim_lower):
+            claimed_number = int(claim.extracted_numbers[0])
             estimated_days = match_count / float(rate)
             evidence = (
                 f"  Claimed: ~{claimed_number} days runway\n"
@@ -721,7 +750,35 @@ def _verify_regex_count(
             else:
                 result = VerificationResult.FAILED
                 evidence += f"  → Mismatch (tolerance: ±{int(tolerance)})"
+        elif remaining_match or total_match:
+            # Handle "X total, Y remaining" claims with separate checks
+            checks = []
+            if total_match:
+                claimed_total = int(total_match.group(1))
+                tolerance_t = max(claimed_total * 0.2, 2)
+                ok = abs(total_raw - claimed_total) <= tolerance_t
+                checks.append(("total", claimed_total, total_raw, tolerance_t, ok))
+            if remaining_match and posted_file:
+                claimed_remaining = int(remaining_match.group(1))
+                tolerance_r = max(claimed_remaining * 0.2, 2)
+                ok = abs(match_count - claimed_remaining) <= tolerance_r
+                checks.append(("remaining", claimed_remaining, match_count, tolerance_r, ok))
+
+            evidence_parts = []
+            all_ok = True
+            for label, claimed, actual, tol, ok in checks:
+                evidence_parts.append(f"  {label.capitalize()}: claimed {claimed}, actual {actual}")
+                if not ok:
+                    all_ok = False
+            evidence = "\n".join(evidence_parts) + "\n"
+            if all_ok:
+                result = VerificationResult.PASSED
+                evidence += "  → Counts match"
+            else:
+                result = VerificationResult.FAILED
+                evidence += "  → Count mismatch"
         else:
+            claimed_number = int(claim.extracted_numbers[0])
             evidence = f"  Count: {match_count} matches\n"
             tolerance = max(claimed_number * 0.2, 2)
             if abs(match_count - claimed_number) <= tolerance:
@@ -824,6 +881,55 @@ def _find_scoped_test_dir(claim_text: str, root: Path) -> Optional[Path]:
     return None
 
 
+def verify_registry(paths: List[str]) -> VerificationOutcome:
+    """Verify that referenced files appear in SYSTEM_REGISTRY.md.
+
+    Loads the registry and checks whether each path is mentioned.
+    Files not in the registry = FAILED with evidence.
+    """
+    root = _get_workspace_root()
+    registry_path = root / "core" / "SYSTEM_REGISTRY.md"
+
+    if not registry_path.exists():
+        return VerificationOutcome(
+            claim=Claim(text="", claim_type=ClaimType.REGISTRY_VIOLATION,
+                        verifiability=VerifiabilityLevel.AUTO),
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="core/SYSTEM_REGISTRY.md not found",
+            checked_at=datetime.now(timezone.utc).isoformat(),
+            method="registry_check",
+        )
+
+    registry_text = registry_path.read_text()
+    results = []
+    any_missing = False
+
+    for path_str in paths:
+        # Normalize: check both the full path and the basename
+        basename = Path(path_str).name
+        # Check if the path or basename appears in the registry
+        in_registry = (
+            f"`{path_str}`" in registry_text
+            or f"`{basename}`" in registry_text
+            or path_str in registry_text
+        )
+        if in_registry:
+            results.append(f"  {path_str}: in registry")
+        else:
+            results.append(f"  {path_str}: NOT in SYSTEM_REGISTRY.md")
+            any_missing = True
+
+    evidence = "\n".join(results)
+    return VerificationOutcome(
+        claim=Claim(text="", claim_type=ClaimType.REGISTRY_VIOLATION,
+                    verifiability=VerifiabilityLevel.AUTO),
+        result=VerificationResult.FAILED if any_missing else VerificationResult.PASSED,
+        evidence=evidence,
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        method="registry_check",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main verification dispatcher
 # ---------------------------------------------------------------------------
@@ -888,6 +994,11 @@ def verify_claim(claim: Claim) -> VerificationOutcome:
             outcome = verify_config_present(config_paths, keys)
             outcome.claim = claim
             return outcome
+
+    if claim.claim_type == ClaimType.REGISTRY_VIOLATION and claim.extracted_paths:
+        outcome = verify_registry(claim.extracted_paths)
+        outcome.claim = claim
+        return outcome
 
     # Pipeline/service status claims without file paths — resolve via name
     if claim.claim_type in (ClaimType.PIPELINE_WORKS, ClaimType.PIPELINE_BLOCKED) and not claim.extracted_paths:

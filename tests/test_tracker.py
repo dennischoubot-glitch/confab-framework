@@ -16,7 +16,11 @@ from confab.tracker import (
     get_stats,
     remove_claims,
     remove_stale,
+    get_cascade_history,
+    get_cascade_stats,
+    trace_claim,
     TrackedClaim,
+    CascadeEntry,
     TrackingStatus,
     DEFAULT_STALE_THRESHOLD,
 )
@@ -332,6 +336,192 @@ class TestTrackedClaimToDict(unittest.TestCase):
         self.assertEqual(d["hash"], "abc123")
         self.assertEqual(d["run_count"], 5)
         self.assertEqual(d["status"], "stale")
+
+
+class TestCascadeHistory(unittest.TestCase):
+    """Test cascade history recording and retrieval."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test_cascade.db"
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            db_path=self.db_path,
+        ))
+
+    def tearDown(self):
+        reset_config()
+
+    def _make_claim(self, text, ctype=ClaimType.FILE_EXISTS):
+        return Claim(
+            text=text,
+            claim_type=ctype,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+
+    def test_cascade_recorded_on_gate_run(self):
+        """Each gate run records a cascade_history entry per claim."""
+        claim = self._make_claim("cascade test claim")
+        record_gate_run(
+            claims=[claim], verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        h = _hash_claim(claim.text)
+        history = get_cascade_history(h, self.db_path)
+        self.assertEqual(len(history), 1)
+        self.assertIsInstance(history[0], CascadeEntry)
+
+    def test_cascade_depth_grows_with_runs(self):
+        """Multiple gate runs produce multiple cascade entries."""
+        claim = self._make_claim("persistent claim for cascade")
+        for _ in range(5):
+            record_gate_run(
+                claims=[claim], verification_results={},
+                files_scanned=["t.md"], db_path=self.db_path,
+            )
+        h = _hash_claim(claim.text)
+        history = get_cascade_history(h, self.db_path)
+        self.assertEqual(len(history), 5)
+
+    def test_cascade_records_status_at_each_run(self):
+        """Cascade history captures the status at each gate run."""
+        claim = self._make_claim("status tracking claim")
+        h = _hash_claim(claim.text)
+
+        # Run 1: new
+        record_gate_run(
+            claims=[claim], verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        # Run 2: unverified
+        record_gate_run(
+            claims=[claim], verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        # Run 3: verified
+        record_gate_run(
+            claims=[claim],
+            verification_results={h: VerificationResult.PASSED},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        history = get_cascade_history(h, self.db_path)
+        self.assertEqual(len(history), 3)
+        # After recording, statuses reflect the claim's state at that run
+        statuses = [e.status for e in history]
+        # The last entry should be "verified" since it passed
+        self.assertEqual(statuses[-1], "verified")
+
+
+class TestCascadeStats(unittest.TestCase):
+    """Test cascade depth statistics."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test_stats.db"
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            db_path=self.db_path,
+        ))
+
+    def tearDown(self):
+        reset_config()
+
+    def _make_claim(self, text):
+        return Claim(
+            text=text,
+            claim_type=ClaimType.FILE_EXISTS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+
+    def test_empty_stats(self):
+        stats = get_cascade_stats(self.db_path)
+        self.assertEqual(stats["avg_depth"], 0.0)
+        self.assertEqual(stats["max_depth"], 0)
+        self.assertEqual(stats["total_cascaded"], 0)
+
+    def test_stats_with_data(self):
+        c1 = self._make_claim("claim one stats")
+        c2 = self._make_claim("claim two stats")
+
+        # c1 appears 5 times, c2 appears 2 times
+        for i in range(5):
+            claims = [c1] if i < 3 else [c1, c2]
+            if i >= 3:
+                claims = [c1, c2]
+            else:
+                claims = [c1]
+            record_gate_run(
+                claims=claims, verification_results={},
+                files_scanned=["t.md"], db_path=self.db_path,
+            )
+
+        stats = get_cascade_stats(self.db_path)
+        self.assertEqual(stats["max_depth"], 5)  # c1 appeared 5 times
+        self.assertGreater(stats["avg_depth"], 0)
+        self.assertGreater(stats["total_tracked"], 0)
+
+    def test_top_cascaders_limited(self):
+        """Top cascaders list is capped at 10."""
+        claims = [self._make_claim(f"claim {i}") for i in range(15)]
+        record_gate_run(
+            claims=claims, verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        stats = get_cascade_stats(self.db_path)
+        self.assertLessEqual(len(stats["top_cascaders"]), 10)
+
+
+class TestTraceClaim(unittest.TestCase):
+    """Test claim tracing by text search."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test_trace.db"
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            db_path=self.db_path,
+        ))
+
+    def tearDown(self):
+        reset_config()
+
+    def test_trace_not_found(self):
+        result = trace_claim("nonexistent claim", self.db_path)
+        self.assertIsNone(result)
+
+    def test_trace_by_substring(self):
+        claim = Claim(
+            text="OPENAI_API_KEY is missing",
+            claim_type=ClaimType.ENV_VAR,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        record_gate_run(
+            claims=[claim], verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        result = trace_claim("OPENAI_API_KEY", self.db_path)
+        self.assertIsNotNone(result)
+        self.assertIn("claim", result)
+        self.assertIn("cascade", result)
+        self.assertEqual(result["cascade_depth"], 1)
+
+    def test_trace_by_hash(self):
+        claim = Claim(
+            text="trace by hash test",
+            claim_type=ClaimType.FILE_EXISTS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        h = _hash_claim(claim.text)
+        record_gate_run(
+            claims=[claim], verification_results={},
+            files_scanned=["t.md"], db_path=self.db_path,
+        )
+        result = trace_claim(h, self.db_path)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["claim"]["hash"], h)
 
 
 if __name__ == "__main__":

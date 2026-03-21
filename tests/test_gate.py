@@ -206,5 +206,143 @@ class TestQuickCheck(unittest.TestCase):
         self.assertIn("Gate:", result)
 
 
+class TestRegistryEnforcement(unittest.TestCase):
+    """Test registry violation detection in the gate."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        # Create core/SYSTEM_REGISTRY.md with some registered resources
+        core_dir = Path(self.tmpdir) / "core"
+        core_dir.mkdir()
+        (core_dir / "SYSTEM_REGISTRY.md").write_text(
+            "# System Registry\n\n"
+            "| Path | Purpose | Status |\n"
+            "|------|---------|--------|\n"
+            "| `kalshi_market_data.db` | Market data | canonical |\n"
+            "| `data/market_scan.json` | Scan output | canonical |\n"
+            "| `scripts/kalshi_portfolio.py` | Portfolio | canonical |\n"
+            "| `slack-bridge/history.db` | Agent history | canonical |\n"
+        )
+        # Also need core/agents dir so _is_ia_repo works
+        (core_dir / "confab").mkdir()
+        (core_dir / "confab" / "__init__.py").write_text("")
+        (core_dir / "agents").mkdir()
+
+        self.config = ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            db_path=Path(self.tmpdir) / "test_tracker.db",
+        )
+        set_config(self.config)
+
+    def tearDown(self):
+        reset_config()
+
+    def test_no_violations_for_registered_files(self):
+        """Files in the registry should not be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text(
+            "- Using `kalshi_market_data.db` for market data\n"
+            "- Run `scripts/kalshi_portfolio.py` for portfolio review\n"
+        )
+        report = run_gate(files=[str(md)], track=False)
+        self.assertEqual(len(report.registry_violations), 0)
+
+    def test_violations_for_unregistered_db(self):
+        """Unregistered .db files should be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Created `agent_state.db` to track sessions\n")
+        report = run_gate(files=[str(md)], track=False)
+        self.assertEqual(len(report.registry_violations), 1)
+        self.assertEqual(report.registry_violations[0]['path'], 'agent_state.db')
+        self.assertIn('Register', report.registry_violations[0]['action'])
+
+    def test_violations_for_unregistered_json(self):
+        """Unregistered .json data files should be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Updated `data/custom_signals.json` with new data\n")
+        report = run_gate(files=[str(md)], track=False)
+        violations = [v for v in report.registry_violations if v['path'] == 'data/custom_signals.json']
+        self.assertEqual(len(violations), 1)
+
+    def test_violations_for_unregistered_script(self):
+        """Unregistered .py scripts should be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Run `scripts/new_pipeline.py` for data processing\n")
+        report = run_gate(files=[str(md)], track=False)
+        violations = [v for v in report.registry_violations if v['path'] == 'scripts/new_pipeline.py']
+        self.assertEqual(len(violations), 1)
+
+    def test_skips_test_files(self):
+        """test_*.py files should not be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Fixed `test_verify.py` tests\n")
+        report = run_gate(files=[str(md)], track=False)
+        test_violations = [v for v in report.registry_violations if 'test_verify' in v['path']]
+        self.assertEqual(len(test_violations), 0)
+
+    def test_skips_framework_internals(self):
+        """Files under core/confab/ should not be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Updated `core/confab/verify.py` with new verifier\n")
+        report = run_gate(files=[str(md)], track=False)
+        confab_violations = [v for v in report.registry_violations if 'core/confab/' in v['path']]
+        self.assertEqual(len(confab_violations), 0)
+
+    def test_skips_package_json(self):
+        """Common config files like package.json should not be flagged."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Updated `package.json` with new deps\n")
+        report = run_gate(files=[str(md)], track=False)
+        pkg_violations = [v for v in report.registry_violations if 'package.json' in v['path']]
+        self.assertEqual(len(pkg_violations), 0)
+
+    def test_report_not_clean_with_violations(self):
+        """Gate report should not be clean when violations exist."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Created `orphan.db` for temporary data\n")
+        report = run_gate(files=[str(md)], track=False)
+        self.assertTrue(report.has_registry_violations)
+        self.assertFalse(report.clean)
+
+    def test_violations_in_format_report(self):
+        """Violations should appear in the formatted report."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Created `orphan.db` for temporary data\n")
+        report = run_gate(files=[str(md)], track=False)
+        text = report.format_report()
+        self.assertIn("REGISTRY VIOLATIONS", text)
+        self.assertIn("orphan.db", text)
+
+    def test_violations_in_to_dict(self):
+        """Violations should appear in the dict output."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Created `orphan.db` for temporary data\n")
+        report = run_gate(files=[str(md)], track=False)
+        d = report.to_dict()
+        self.assertIn("registry_violations", d)
+        self.assertEqual(len(d["registry_violations"]), 1)
+
+    def test_deduplicates_paths(self):
+        """Same path referenced multiple times should only appear once."""
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text(
+            "- `orphan.db` is used for state\n"
+            "- Check `orphan.db` for recent data\n"
+        )
+        report = run_gate(files=[str(md)], track=False)
+        orphan_violations = [v for v in report.registry_violations if v['path'] == 'orphan.db']
+        self.assertEqual(len(orphan_violations), 1)
+
+    def test_no_registry_file_returns_empty(self):
+        """When SYSTEM_REGISTRY.md doesn't exist, no violations are reported."""
+        import os
+        os.remove(str(Path(self.tmpdir) / "core" / "SYSTEM_REGISTRY.md"))
+        md = Path(self.tmpdir) / "priorities.md"
+        md.write_text("- Created `orphan.db` for data\n")
+        report = run_gate(files=[str(md)], track=False)
+        self.assertEqual(len(report.registry_violations), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

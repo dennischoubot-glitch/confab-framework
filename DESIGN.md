@@ -283,6 +283,57 @@ The tracker adds that missing memory. After 3 gate runs where a claim appears bu
 - **Staleness threshold = 3:** Matches the existing obs-3530 two-agent verification rule. Three gate runs without verification is the signal.
 - **Separate from in-file staleness:** The original `age_builds` counted build sections within a single file. The tracker counts across separate gate invocations — a fundamentally different (and more useful) staleness signal.
 
+## Cascade Tracking (Thread 2: Prevention, Extended)
+
+Added March 20, 2026. The staleness tracker now records per-run claim appearances, enabling lineage tracing and cascade depth measurement.
+
+### Problem
+
+The staleness tracker (added March 19) counts *how many times* a claim has appeared — but not *when*, *in what status*, or *how it propagated*. The 16-build false blocker episode (obs-3528) would be retroactively measurable if we could trace: "this claim first appeared at run #X, was unverified for runs #X through #Y, and was finally caught at run #Z."
+
+### How it works
+
+Each `gate` run now also records one row per claim in `cascade_history`:
+
+```sql
+CREATE TABLE cascade_history (
+    id INTEGER PRIMARY KEY,
+    claim_hash TEXT NOT NULL,    -- links to tracked_claims
+    gate_run_id INTEGER NOT NULL, -- links to gate_runs
+    status TEXT NOT NULL,       -- claim status at this run
+    source_file TEXT
+);
+```
+
+This produces the core metric: **cascade depth** — how many gate runs a claim survived before being caught or resolved.
+
+### CLI commands
+
+```bash
+# Trace a specific claim's propagation path
+confab trace "OPENAI_API_KEY"     # search by substring
+confab trace abc123def456         # search by hash
+confab trace "audio" --json
+
+# Cascade depth statistics across all claims
+confab cascade
+confab cascade --json
+```
+
+### Cascade metrics
+
+- **Average cascade depth:** Mean number of gate runs per claim
+- **Max cascade depth:** Deepest propagation (worst offender)
+- **Cascade rate:** Percentage of claims that propagated 2+ runs
+- **Resolution count:** How many cascaded claims were eventually resolved
+- **Top cascaders:** The claims with the deepest propagation
+
+The `confab report` dashboard now includes cascade statistics in the CLAIMS section.
+
+### Why this matters
+
+The 16-build false blocker cascade is now measurable on real ia data. Future cascade episodes will be visible in the trace output — showing exactly which gate runs carried a false claim forward, and how long it took to catch it. This is the core innovation: not just detecting confabulation, but measuring its propagation dynamics.
+
 ## What This Does NOT Do
 
 - Replace human judgment for subjective claims

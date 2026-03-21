@@ -33,6 +33,15 @@ Usage:
     confab report --json
     confab report --slack   # concise Slack-friendly output
 
+    # Trace the propagation path of a specific claim
+    confab trace "OPENAI_API_KEY"
+    confab trace abc123def456    # by hash
+    confab trace "audio" --json
+
+    # Cascade depth statistics across all claims
+    confab cascade
+    confab cascade --json
+
     # Check knowledge tree structural integrity (zombie/weakened entries)
     confab check-supports
     confab check-supports --json
@@ -58,6 +67,7 @@ try:
     from .tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
+        get_cascade_stats, trace_claim,
     )
     from .verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
 except ImportError:
@@ -70,6 +80,7 @@ except ImportError:
     from core.confab.tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
+        get_cascade_stats, trace_claim,
     )
     from core.confab.verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
 
@@ -326,6 +337,18 @@ def _format_health_dashboard(gate_report, supports_report):
         claim_pct = gate_report.passed / gate_report.auto_verified * 100
         lines.append(f"  Pass rate: {claim_pct:.0f}% ({gate_report.passed}/{gate_report.auto_verified} auto-verified)")
     lines.append(f"  Files: {', '.join(gate_report.files_scanned) or '(none)'}")
+
+    # --- Cascade section ---
+    try:
+        cascade_stats = get_cascade_stats()
+        if cascade_stats["total_tracked"] > 0:
+            lines.append("")
+            lines.append(f"  Cascade: avg depth {cascade_stats['avg_depth']} | "
+                         f"max depth {cascade_stats['max_depth']} | "
+                         f"{cascade_stats['total_cascaded']} propagated | "
+                         f"{cascade_stats['resolved_count']} resolved")
+    except Exception:
+        pass
 
     if gate_report.has_failures:
         lines.append("")
@@ -609,6 +632,17 @@ Examples:
     supports_parser.add_argument("--tree", "-t", help="Path to KNOWLEDGE_TREE.json (default: auto-detect)")
     supports_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     supports_parser.add_argument("--slack", action="store_true", help="Slack-friendly output")
+    supports_parser.add_argument("--fix", action="store_true", help="Auto-invalidate zombie entries (all supports dead)")
+    supports_parser.add_argument("--dry-run", action="store_true", help="With --fix: show what would be invalidated without modifying")
+
+    # trace — trace the propagation of a specific claim
+    trace_parser = subparsers.add_parser("trace", help="Trace propagation path of a specific claim")
+    trace_parser.add_argument("query", help="Claim hash or text substring to search for")
+    trace_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+
+    # cascade — cascade depth statistics
+    cascade_parser = subparsers.add_parser("cascade", help="Show cascade depth statistics")
+    cascade_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
 
     # init — generate a starter confab.toml
     init_parser = subparsers.add_parser("init", help="Generate a starter confab.toml in the current directory")
@@ -636,6 +670,10 @@ Examples:
         cmd_sweep(args)
     elif args.command == "check-supports":
         cmd_check_supports(args)
+    elif args.command == "trace":
+        cmd_trace(args)
+    elif args.command == "cascade":
+        cmd_cascade(args)
     elif args.command == "init":
         cmd_init(args)
     else:
@@ -644,6 +682,36 @@ Examples:
 
 def cmd_check_supports(args):
     """Check knowledge tree for entries with degraded support structures."""
+    if args.fix:
+        try:
+            from .supports import fix_zombies
+        except ImportError:
+            from core.confab.supports import fix_zombies
+
+        dry_run = args.dry_run
+        result = fix_zombies(tree_path=args.tree, dry_run=dry_run)
+        report = result["report"]
+
+        if not result["fixed"]:
+            print("No zombie entries to fix.")
+            return
+
+        if dry_run:
+            print(f"DRY RUN — would invalidate {len(result['fixed'])} zombie entries:")
+            for entry_id in result["fixed"]:
+                zombie = next((z for z in report.zombies if z.entry_id == entry_id), None)
+                if zombie:
+                    print(f"  {entry_id} ({zombie.entry_type}) — {zombie.content[:80]}")
+            print(f"\nRun without --dry-run to apply.")
+        else:
+            print(f"Fixed {len(result['fixed'])} zombie entries:")
+            for entry_id in result["fixed"]:
+                print(f"  invalidated {entry_id}")
+            if result["skipped"]:
+                print(f"Skipped {len(result['skipped'])}: {', '.join(result['skipped'])}")
+
+        return
+
     check_supports = _get_check_supports()
     report = check_supports(tree_path=args.tree)
 
@@ -658,19 +726,157 @@ def cmd_check_supports(args):
         sys.exit(1)
 
 
+def cmd_trace(args):
+    """Trace the propagation path of a specific claim."""
+    result = trace_claim(args.query)
+
+    if result is None:
+        print(f"No claim found matching: {args.query}")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    claim = result["claim"]
+    cascade = result["cascade"]
+    depth = result["cascade_depth"]
+
+    print("# Claim Trace\n")
+    print(f"**Text:** {claim['text'][:200]}")
+    print(f"**Type:** {claim['type']}")
+    print(f"**Status:** {claim['status']}")
+    print(f"**Source:** {claim.get('source', 'unknown')}")
+    print(f"**First seen:** {claim['first_seen'][:19]}")
+    print(f"**Last seen:** {claim['last_seen'][:19]}")
+    print(f"**Run count:** {claim['run_count']}")
+    print(f"**Cascade depth:** {depth}")
+
+    if not cascade:
+        print("\nNo cascade history recorded (tracking started after this claim).")
+        return
+
+    print(f"\n## Propagation Timeline ({len(cascade)} appearances)\n")
+    for i, entry in enumerate(cascade):
+        marker = "  "
+        if entry["status"] == "verified":
+            marker = "ok"
+        elif entry["status"] == "failed":
+            marker = "xx"
+        elif entry["status"] == "stale":
+            marker = "!!"
+        elif entry["status"] in ("new", "unverified"):
+            marker = ".."
+
+        ts = entry["timestamp"][:19]
+        print(f"  {marker} Run #{entry['run_id']:3d}  {ts}  [{entry['status']}]"
+              + (f"  <- {entry['source']}" if entry.get("source") else ""))
+
+    # Show cascade analysis
+    statuses = [e["status"] for e in cascade]
+    unverified_streak = 0
+    max_streak = 0
+    for s in statuses:
+        if s in ("new", "unverified", "inconclusive", "stale"):
+            unverified_streak += 1
+            max_streak = max(max_streak, unverified_streak)
+        else:
+            unverified_streak = 0
+
+    if max_streak > 1:
+        print(f"\n  Longest unverified streak: {max_streak} consecutive runs")
+
+    if "verified" in statuses:
+        first_verified = next(i for i, s in enumerate(statuses) if s == "verified")
+        print(f"  Runs before first verification: {first_verified}")
+
+
+def cmd_cascade(args):
+    """Show cascade depth statistics across all tracked claims."""
+    stats = get_cascade_stats()
+
+    if args.json:
+        print(json.dumps(stats, indent=2))
+        return
+
+    print("# Cascade Statistics\n")
+
+    if stats["total_tracked"] == 0:
+        print("No cascade data yet. Run `confab gate` to start tracking.")
+        return
+
+    print(f"Total claims tracked: {stats['total_tracked']}")
+    print(f"Claims that cascaded (2+ runs): {stats['total_cascaded']}")
+    print(f"Claims resolved: {stats['resolved_count']}")
+    print(f"Average cascade depth: {stats['avg_depth']} runs")
+    print(f"Maximum cascade depth: {stats['max_depth']} runs")
+
+    if stats["total_cascaded"] > 0 and stats["total_tracked"] > 0:
+        cascade_rate = stats["total_cascaded"] / stats["total_tracked"] * 100
+        print(f"Cascade rate: {cascade_rate:.0f}% of claims propagated 2+ runs")
+
+    if stats["top_cascaders"]:
+        print(f"\n## Deepest Cascaders\n")
+        for c in stats["top_cascaders"][:5]:
+            status_icon = {
+                "verified": "ok", "failed": "xx", "stale": "!!",
+                "expired": "~~", "unverified": "..",
+            }.get(c["status"], "??")
+            print(f"  [{status_icon}] depth={c['depth']:3d}  {c['text'][:80]}")
+
+
 def cmd_init(args):
-    """Generate a starter confab.toml in the current directory."""
+    """Generate a starter confab.toml in the current directory.
+
+    Auto-detects markdown files in the project and suggests them as scan targets.
+    """
     target = Path.cwd() / "confab.toml"
     if target.exists():
         print(f"confab.toml already exists at {target}")
         sys.exit(1)
 
-    target.write_text("""\
+    # Auto-detect markdown files that look like priority/handoff files
+    cwd = Path.cwd()
+    md_files = sorted(cwd.rglob("*.md"))
+
+    # Filter to likely scan targets (priority files, handoffs, notes)
+    # Skip common non-claim files (README, LICENSE, CHANGELOG, etc.)
+    skip_names = {
+        'readme', 'license', 'changelog', 'contributing', 'code_of_conduct',
+        'security', 'design', 'architecture',
+    }
+    skip_dirs = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.tox', 'dist', 'build'}
+
+    candidates = []
+    for md in md_files:
+        # Skip files in ignored directories
+        if any(part in skip_dirs for part in md.parts):
+            continue
+        # Skip common non-claim files
+        if md.stem.lower() in skip_names:
+            continue
+        # Prefer files that look like priorities, handoffs, or notes
+        rel = md.relative_to(cwd)
+        candidates.append(str(rel))
+
+    # Build the files_to_scan section
+    if candidates:
+        # Show up to 10 auto-detected files, commented out for user to pick
+        file_lines = []
+        for c in candidates[:10]:
+            file_lines.append(f'    # "{c}",')
+        if len(candidates) > 10:
+            file_lines.append(f"    # ... and {len(candidates) - 10} more .md files found")
+        files_block = "\n".join(file_lines)
+    else:
+        files_block = '    # "docs/priorities.md",\n    # "notes/handoff.md",'
+
+    content = f"""\
 [confab]
 # Files to scan for carry-forward claims (relative to workspace root)
+# Uncomment the files you want confab to monitor for stale claims.
 files_to_scan = [
-    # "docs/priorities.md",
-    # "notes/handoff.md",
+{files_block}
 ]
 
 # How many gate runs before unverified claims are flagged stale
@@ -678,6 +884,14 @@ stale_threshold = 3
 
 # Where to store the tracker database (relative to workspace root)
 db_path = "confab_tracker.db"
+
+# Sections to skip during claim extraction (regex patterns matched against headings).
+# Lines under these headings are treated as knowledge notes, not system state claims.
+# This prevents false positives from sections that contain ideas or strategic context.
+exclude_sections = [
+    # "Germinating threads",
+    # "Strategic Context",
+]
 
 # Known environment variable names to detect in claims
 [confab.env_vars]
@@ -705,8 +919,11 @@ known = [
 # type = "regex_count"      # count regex matches
 # pattern = "^###\\\\s+Task\\\\s+\\\\d+"
 # rate_per_day = 3.0        # for runway estimates
-""")
+"""
+    target.write_text(content)
     print(f"Created {target}")
+    if candidates:
+        print(f"Auto-detected {len(candidates)} markdown file(s) — uncomment the ones to scan.")
     print("Edit the file to configure your scan targets, then run: confab gate")
 
 

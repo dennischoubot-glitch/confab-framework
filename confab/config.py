@@ -27,6 +27,13 @@ known = ["OPENAI_API_KEY", "DATABASE_URL"]
 # Pipeline output mappings: script name -> expected output paths
 [confab.pipelines]
 "my_pipeline.py" = ["output/data/", "output/report.json"]
+
+# Sections to skip during claim extraction (regex patterns matched against headings)
+# Lines under these headings are knowledge notes, not system state claims
+exclude_sections = [
+    "Germinating threads",
+    "For Next Dreamer",
+]
 ```
 """
 
@@ -74,6 +81,16 @@ _IA_KNOWN_ENV_VARS = {
     'AWS_SECRET_ACCESS_KEY', 'GOOGLE_API_KEY',
 }
 
+# Sections to skip during claim extraction (regex patterns matched against headings).
+# These sections contain knowledge notes, germinating ideas, or strategic context
+# that are NOT system state claims and should not trigger stale warnings.
+_IA_EXCLUDE_SECTIONS = [
+    r"Germinating threads",
+    r"For Next Dreamer",
+    r"Active Tensions",
+    r"Settled Stances",
+]
+
 # Count verification sources: keyword pattern -> {file, type, count_pattern}
 # Used by verify.py to check count claims against actual data.
 _IA_COUNT_SOURCES = {
@@ -86,7 +103,8 @@ _IA_COUNT_SOURCES = {
         "file": "projects/synthesis/scripts/notes_queue.md",
         "type": "regex_count",          # count regex matches
         "pattern": r"^###\s+Note\s+\d+",
-        "rate_per_day": 2.0,            # for runway estimates
+        "rate_per_day": 3.0,            # 3x/day cron (9am, 1pm, 5pm PST)
+        "posted_file": "projects/synthesis/scripts/.notes_posted",  # subtract posted count
     },
 }
 
@@ -102,6 +120,7 @@ class ConfabConfig:
     pipeline_names: Dict[str, str] = field(default_factory=dict)
     known_env_vars: Set[str] = field(default_factory=set)
     count_sources: Dict[str, Dict] = field(default_factory=dict)
+    exclude_sections: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.db_path is None:
@@ -150,12 +169,13 @@ def load_config(
     Search order for confab.toml:
     1. Explicit config_path if provided
     2. workspace_root / confab.toml
-    3. Current directory / confab.toml
+    3. Current directory / confab.toml (only when workspace_root was auto-detected)
 
     If no config file found:
     - Inside ia repo: use ia-specific defaults
     - Otherwise: use minimal defaults (empty files_to_scan)
     """
+    explicit_root = workspace_root is not None
     if workspace_root is None:
         workspace_root = _detect_workspace_root()
 
@@ -165,7 +185,7 @@ def load_config(
         toml_data = _load_toml(config_path)
     elif (workspace_root / CONFIG_FILENAME).exists():
         toml_data = _load_toml(workspace_root / CONFIG_FILENAME)
-    elif Path.cwd() != workspace_root and (Path.cwd() / CONFIG_FILENAME).exists():
+    elif not explicit_root and Path.cwd() != workspace_root and (Path.cwd() / CONFIG_FILENAME).exists():
         toml_data = _load_toml(Path.cwd() / CONFIG_FILENAME)
 
     if toml_data is not None:
@@ -180,6 +200,7 @@ def load_config(
             pipeline_names=dict(_IA_PIPELINE_NAMES),
             known_env_vars=set(_IA_KNOWN_ENV_VARS),
             count_sources=dict(_IA_COUNT_SOURCES),
+            exclude_sections=list(_IA_EXCLUDE_SECTIONS),
         )
 
     # Standalone with no config — empty scan list
@@ -214,6 +235,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
     known = set(env_section.get("known", []))
 
     count_sources = confab.get("count_sources", {})
+    exclude_sections = confab.get("exclude_sections", [])
 
     return ConfabConfig(
         workspace_root=workspace_root,
@@ -224,6 +246,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
         pipeline_names=pipeline_names,
         known_env_vars=known,
         count_sources=count_sources,
+        exclude_sections=exclude_sections,
     )
 
 
