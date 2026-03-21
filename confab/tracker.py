@@ -575,6 +575,108 @@ def trace_claim(
     }
 
 
+def get_audit_data(
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compile a comprehensive audit summary from the tracker DB.
+
+    Returns:
+        Dict with claims_summary, depth_distribution, resolution_rate,
+        unresolved_cascaders, and recent_runs.
+    """
+    conn = _get_db(db_path)
+
+    # --- Claims summary ---
+    total = conn.execute("SELECT COUNT(*) FROM tracked_claims").fetchone()[0]
+    by_status = {}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) as cnt FROM tracked_claims GROUP BY status"
+    ).fetchall():
+        by_status[row["status"]] = row["cnt"]
+
+    run_count = conn.execute("SELECT COUNT(*) FROM gate_runs").fetchone()[0]
+    latest_run = conn.execute(
+        "SELECT timestamp FROM gate_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    # --- Cascade depth distribution ---
+    depth_rows = conn.execute("""
+        SELECT ch.claim_hash, COUNT(ch.id) as depth
+        FROM cascade_history ch
+        GROUP BY ch.claim_hash
+    """).fetchall()
+
+    buckets = {"1": 0, "2-5": 0, "6-10": 0, "11-20": 0, "21+": 0}
+    for r in depth_rows:
+        d = r["depth"]
+        if d == 1:
+            buckets["1"] += 1
+        elif d <= 5:
+            buckets["2-5"] += 1
+        elif d <= 10:
+            buckets["6-10"] += 1
+        elif d <= 20:
+            buckets["11-20"] += 1
+        else:
+            buckets["21+"] += 1
+
+    # --- Resolution rate ---
+    resolved = conn.execute(
+        "SELECT COUNT(*) FROM tracked_claims WHERE status IN ('verified', 'expired')"
+    ).fetchone()[0]
+    resolution_rate = round(resolved / total * 100, 1) if total > 0 else 0.0
+
+    # --- Top 5 unresolved cascaders ---
+    unresolved_rows = conn.execute("""
+        SELECT
+            tc.claim_hash, tc.claim_text, tc.status, tc.run_count,
+            tc.source_file, tc.first_seen, tc.last_seen,
+            COUNT(ch.id) as depth
+        FROM tracked_claims tc
+        LEFT JOIN cascade_history ch ON tc.claim_hash = ch.claim_hash
+        WHERE tc.status NOT IN ('verified', 'expired')
+        GROUP BY tc.claim_hash
+        ORDER BY depth DESC
+        LIMIT 5
+    """).fetchall()
+
+    unresolved_cascaders = []
+    for r in unresolved_rows:
+        unresolved_cascaders.append({
+            "hash": r["claim_hash"],
+            "text": r["claim_text"][:100],
+            "status": r["status"],
+            "depth": r["depth"],
+            "run_count": r["run_count"],
+            "source": r["source_file"],
+        })
+
+    # --- Recent gate runs ---
+    recent_rows = conn.execute("""
+        SELECT * FROM gate_runs ORDER BY id DESC LIMIT 5
+    """).fetchall()
+    recent_runs = [dict(r) for r in recent_rows]
+
+    conn.close()
+
+    return {
+        "claims_summary": {
+            "total_tracked": total,
+            "by_status": by_status,
+            "total_gate_runs": run_count,
+            "latest_run": latest_run["timestamp"] if latest_run else None,
+        },
+        "depth_distribution": buckets,
+        "resolution": {
+            "resolved": resolved,
+            "total": total,
+            "rate_pct": resolution_rate,
+        },
+        "unresolved_cascaders": unresolved_cascaders,
+        "recent_runs": recent_runs,
+    }
+
+
 def _row_to_tracked(row: sqlite3.Row) -> TrackedClaim:
     """Convert a database row to a TrackedClaim."""
     return TrackedClaim(

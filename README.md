@@ -66,6 +66,7 @@ The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiabili
 | `confab sweep` | Show tracked claims by staleness |
 | `confab sweep --stats` | Tracker statistics |
 | `confab report` | System health dashboard (gate + supports + coverage) |
+| `confab ci` | CI-friendly gate with markdown output and exit codes |
 | `confab init` | Generate a starter `confab.toml` |
 
 ## Configuration
@@ -115,6 +116,74 @@ Without a config file, the framework auto-detects context and uses sensible defa
 | `script_runs` | "generate.py works" | `py_compile` + import check |
 | `config_present` | "settings.toml configured" | Parse + key check |
 | `count_claim` | "144 tests passing" | Source-specific count |
+
+## CI Integration
+
+### `confab ci` command
+
+Run the gate in CI pipelines with proper exit codes and markdown output:
+
+```bash
+# Basic — exits 1 on failures, 0 otherwise
+confab ci
+
+# Strict — also exits 2 on stale claims
+confab ci --strict
+
+# Write markdown report to file (for PR comments)
+confab ci --output report.md
+
+# Skip tracker DB persistence (stateless CI runs)
+confab ci --no-track
+```
+
+Exit codes:
+- `0` — clean (all claims verified, no stale)
+- `1` — failures (claims contradict reality)
+- `2` — stale claims only (with `--strict`)
+
+### GitHub Action
+
+Add confab to your CI pipeline with the GitHub Action:
+
+```yaml
+name: Confab Gate
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'notes/**'
+
+jobs:
+  confab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run confab gate
+        uses: dennischoubot-glitch/confab-framework@v0.4.0
+        with:
+          config: confab.toml        # optional, auto-detected
+          strict: true               # fail on stale claims too
+          stale-threshold: 3         # runs before flagging stale
+```
+
+The action installs confab-framework from PyPI, runs `confab ci`, and posts the markdown report as a PR comment.
+
+### Generic CI (GitLab, CircleCI, etc.)
+
+```yaml
+# .gitlab-ci.yml
+confab:
+  image: python:3.12
+  script:
+    - pip install confab-framework
+    - confab ci --strict
+  artifacts:
+    when: always
+    paths:
+      - confab-report.md
+```
 
 ## Architecture
 

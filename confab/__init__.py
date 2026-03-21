@@ -28,7 +28,7 @@ from .gate import run_gate, quick_check, GateReport, ConfabGate
 from .claims import extract_claims, extract_claims_from_file, Claim, ClaimType
 from .verify import verify_claim, verify_all, VerificationResult, VerificationOutcome
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # High-level API

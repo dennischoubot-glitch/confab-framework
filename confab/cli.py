@@ -47,6 +47,16 @@ Usage:
     confab check-supports --json
     confab check-supports --slack
 
+    # Comprehensive audit report (tracker DB summary)
+    confab audit
+    confab audit --json
+
+    # CI mode — markdown output, proper exit codes for pipelines
+    confab ci
+    confab ci --strict               # exit 2 on stale claims
+    confab ci --output report.md     # write markdown to file (for PR comments)
+    confab ci --no-track             # don't persist to tracker DB
+
     # Full JSON output
     confab gate --json
 
@@ -67,7 +77,7 @@ try:
     from .tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
-        get_cascade_stats, trace_claim,
+        get_cascade_stats, trace_claim, get_audit_data,
     )
     from .verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
 except ImportError:
@@ -80,7 +90,7 @@ except ImportError:
     from core.confab.tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
-        get_cascade_stats, trace_claim,
+        get_cascade_stats, trace_claim, get_audit_data,
     )
     from core.confab.verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
 
@@ -582,6 +592,8 @@ Examples:
   confab quick
   confab prune
   confab sweep --stats
+  confab ci
+  confab ci --strict --output report.md
         """,
     )
     parser.add_argument("--config", "-c", help="Path to confab.toml config file")
@@ -644,6 +656,19 @@ Examples:
     cascade_parser = subparsers.add_parser("cascade", help="Show cascade depth statistics")
     cascade_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
 
+    # audit — comprehensive audit report from tracker DB
+    audit_parser = subparsers.add_parser("audit", help="Comprehensive audit summary: claims, cascades, resolution rate")
+    audit_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+
+    # ci — CI-friendly gate with exit codes and markdown output
+    ci_parser = subparsers.add_parser("ci", help="Run gate for CI pipelines (markdown output, exit codes)")
+    ci_parser.add_argument("--file", "-f", help="Specific file to scan")
+    ci_parser.add_argument("--json", "-j", action="store_true", help="JSON output instead of markdown")
+    ci_parser.add_argument("--output", "-o", help="Write markdown report to file (for PR comments)")
+    ci_parser.add_argument("--stale-threshold", type=int, help="Staleness threshold (default: 3 runs)")
+    ci_parser.add_argument("--strict", action="store_true", help="Exit 2 on stale claims (default: only exit 1 on failures)")
+    ci_parser.add_argument("--no-track", action="store_true", help="Don't record this run in the tracker DB")
+
     # init — generate a starter confab.toml
     init_parser = subparsers.add_parser("init", help="Generate a starter confab.toml in the current directory")
 
@@ -674,10 +699,42 @@ Examples:
         cmd_trace(args)
     elif args.command == "cascade":
         cmd_cascade(args)
+    elif args.command == "audit":
+        cmd_audit(args)
+    elif args.command == "ci":
+        cmd_ci(args)
     elif args.command == "init":
         cmd_init(args)
     else:
         parser.print_help()
+
+
+def cmd_ci(args):
+    """Run the gate in CI mode with proper exit codes and markdown output.
+
+    Exit codes:
+        0 — clean (no failures, no stale claims)
+        1 — failures found (claims contradict reality)
+        2 — stale claims found (no failures, but unverified claims persist)
+    """
+    files = [args.file] if args.file else None
+    stale_threshold = args.stale_threshold or 3
+    report = run_gate(files=files, stale_threshold=stale_threshold, track=not args.no_track)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(report.format_ci())
+
+    # Write markdown to file if requested (for GitHub Actions PR comments)
+    if args.output:
+        Path(args.output).write_text(report.format_ci())
+
+    # Exit codes: 1 = failures, 2 = stale only, 0 = clean
+    if report.has_failures:
+        sys.exit(1)
+    elif report.has_stale and args.strict:
+        sys.exit(2)
 
 
 def cmd_check_supports(args):
@@ -823,6 +880,104 @@ def cmd_cascade(args):
                 "expired": "~~", "unverified": "..",
             }.get(c["status"], "??")
             print(f"  [{status_icon}] depth={c['depth']:3d}  {c['text'][:80]}")
+
+
+def cmd_audit(args):
+    """Print a comprehensive audit summary from the tracker database."""
+    data = get_audit_data()
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+
+    summary = data["claims_summary"]
+    dist = data["depth_distribution"]
+    res = data["resolution"]
+    cascaders = data["unresolved_cascaders"]
+    runs = data["recent_runs"]
+
+    lines = []
+    lines.append("=" * 56)
+    lines.append("  CONFAB AUDIT REPORT")
+    lines.append("=" * 56)
+
+    # --- Claims summary ---
+    lines.append("")
+    lines.append("CLAIMS TRACKED")
+    lines.append(f"  Total: {summary['total_tracked']}  |  Gate runs: {summary['total_gate_runs']}")
+    if summary["latest_run"]:
+        lines.append(f"  Latest run: {summary['latest_run'][:19]}")
+    lines.append("")
+    lines.append("  By status:")
+    status_order = ["verified", "unverified", "stale", "failed", "new", "inconclusive", "expired"]
+    for s in status_order:
+        count = summary["by_status"].get(s, 0)
+        if count > 0:
+            lines.append(f"    {s:14s} {count:4d}")
+
+    # --- Resolution rate ---
+    lines.append("")
+    lines.append("-" * 56)
+    lines.append("")
+    lines.append("RESOLUTION RATE")
+    lines.append(f"  {res['rate_pct']:.1f}% ({res['resolved']}/{res['total']} claims resolved)")
+
+    # --- Cascade depth distribution ---
+    lines.append("")
+    lines.append("-" * 56)
+    lines.append("")
+    lines.append("CASCADE DEPTH DISTRIBUTION")
+    total_depth_claims = sum(dist.values())
+    if total_depth_claims > 0:
+        max_bar = max(dist.values()) if dist.values() else 1
+        for bucket, count in dist.items():
+            pct = count / total_depth_claims * 100
+            bar_len = int(count / max_bar * 20) if max_bar > 0 else 0
+            bar = "#" * bar_len
+            lines.append(f"  {bucket:>5s}: {bar:<20s} {count:3d} ({pct:.0f}%)")
+    else:
+        lines.append("  No cascade data yet.")
+
+    # --- Top unresolved cascaders ---
+    lines.append("")
+    lines.append("-" * 56)
+    lines.append("")
+    lines.append("TOP UNRESOLVED CASCADERS")
+    if cascaders:
+        for i, c in enumerate(cascaders, 1):
+            status_icon = {
+                "stale": "!!", "failed": "xx", "unverified": "..",
+                "inconclusive": "??", "new": "++",
+            }.get(c["status"], "  ")
+            lines.append(f"  {i}. [{status_icon}] depth={c['depth']:3d}  runs={c['run_count']:3d}")
+            lines.append(f"     {c['text']}")
+            if c.get("source"):
+                lines.append(f"     src: {c['source']}")
+    else:
+        lines.append("  All claims resolved.")
+
+    # --- Recent runs ---
+    lines.append("")
+    lines.append("-" * 56)
+    lines.append("")
+    lines.append("RECENT GATE RUNS")
+    if runs:
+        for run in runs:
+            ts = run["timestamp"][:19] if run.get("timestamp") else "?"
+            lines.append(
+                f"  #{run['id']:3d}  {ts}  "
+                f"claims={run['total_claims']}  "
+                f"pass={run['passed']}  "
+                f"fail={run['failed']}  "
+                f"stale={run['stale']}"
+            )
+    else:
+        lines.append("  No gate runs recorded yet.")
+
+    lines.append("")
+    lines.append("=" * 56)
+
+    print("\n".join(lines))
 
 
 def cmd_init(args):

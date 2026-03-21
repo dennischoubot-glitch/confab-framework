@@ -1,0 +1,110 @@
+name: 'Confab Gate'
+description: 'Run confabulation detection gate on multi-agent handoff files'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  config:
+    description: 'Path to confab.toml config file'
+    required: false
+    default: ''
+  file:
+    description: 'Specific file to scan (overrides config)'
+    required: false
+    default: ''
+  stale-threshold:
+    description: 'Number of runs before unverified claims are flagged stale'
+    required: false
+    default: '3'
+  strict:
+    description: 'Fail on stale claims (exit 2) in addition to failures (exit 1)'
+    required: false
+    default: 'false'
+  python-version:
+    description: 'Python version to use'
+    required: false
+    default: '3.12'
+
+outputs:
+  status:
+    description: 'Gate result: clean, failed, or stale'
+  report:
+    description: 'Path to the markdown report file'
+  total-claims:
+    description: 'Total number of claims scanned'
+  passed:
+    description: 'Number of claims that passed verification'
+  failed:
+    description: 'Number of claims that failed verification'
+  stale:
+    description: 'Number of stale (unverified) claims'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install confab-framework
+      shell: bash
+      run: pip install confab-framework
+
+    - name: Run confab gate
+      id: gate
+      shell: bash
+      run: |
+        # --config is a parent-level arg, must come before the subcommand
+        GLOBAL_ARGS=""
+        if [ -n "${{ inputs.config }}" ]; then
+          GLOBAL_ARGS="--config ${{ inputs.config }}"
+        fi
+
+        ARGS="--output ${{ github.workspace }}/confab-report.md"
+
+        if [ -n "${{ inputs.file }}" ]; then
+          ARGS="$ARGS --file ${{ inputs.file }}"
+        fi
+
+        if [ "${{ inputs.stale-threshold }}" != "3" ]; then
+          ARGS="$ARGS --stale-threshold ${{ inputs.stale-threshold }}"
+        fi
+
+        if [ "${{ inputs.strict }}" == "true" ]; then
+          ARGS="$ARGS --strict"
+        fi
+
+        ARGS="$ARGS --no-track"
+
+        # Run with --json to capture stats, --output writes markdown report to file
+        set +e
+        confab $GLOBAL_ARGS ci $ARGS --json > /tmp/confab-result.json 2>/dev/null
+        EXIT_CODE=$?
+        set -e
+
+        # Parse claim stats from JSON output
+        if [ -f /tmp/confab-result.json ]; then
+          echo "total-claims=$(python3 -c "import json; d=json.load(open('/tmp/confab-result.json')); print(d.get('total_claims', 0))" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "passed=$(python3 -c "import json; d=json.load(open('/tmp/confab-result.json')); print(d.get('passed', 0))" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "failed=$(python3 -c "import json; d=json.load(open('/tmp/confab-result.json')); print(d.get('failed', 0))" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+          echo "stale=$(python3 -c "import json; d=json.load(open('/tmp/confab-result.json')); print(d.get('stale_claims', 0))" 2>/dev/null || echo 0)" >> $GITHUB_OUTPUT
+        fi
+
+        if [ $EXIT_CODE -eq 0 ]; then
+          echo "status=clean" >> $GITHUB_OUTPUT
+        elif [ $EXIT_CODE -eq 1 ]; then
+          echo "status=failed" >> $GITHUB_OUTPUT
+        elif [ $EXIT_CODE -eq 2 ]; then
+          echo "status=stale" >> $GITHUB_OUTPUT
+        fi
+
+        echo "report=${{ github.workspace }}/confab-report.md" >> $GITHUB_OUTPUT
+        exit $EXIT_CODE
+
+    - name: Add PR comment
+      if: always() && github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        path: ${{ github.workspace }}/confab-report.md
