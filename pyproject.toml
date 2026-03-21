@@ -31,6 +31,3 @@ confab = "confab.cli:main"
 
 [tool.setuptools]
 packages = ["confab"]
-
-[tool.setuptools.package-dir]
-confab = "."
