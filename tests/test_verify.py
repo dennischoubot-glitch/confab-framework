@@ -17,12 +17,16 @@ from confab.verify import (
     verify_env_var,
     verify_script_syntax,
     verify_config_present,
+    verify_process_status,
     verify_registry,
     verify_claim,
     verify_all,
     summarize_outcomes,
     _resolve_path,
     _check_key_in_data,
+    _check_supervisorctl,
+    _check_systemd,
+    _check_ps,
 )
 
 
@@ -273,6 +277,171 @@ class TestVerifyRegistry(unittest.TestCase):
         os.remove(str(Path(self.tmpdir) / "core" / "SYSTEM_REGISTRY.md"))
         outcome = verify_registry(["anything.db"])
         self.assertEqual(outcome.result, VerificationResult.INCONCLUSIVE)
+
+
+class TestVerifyProcessStatus(unittest.TestCase):
+    """Test process/service status verification."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config = ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            process_services={
+                "weather-rewards": {
+                    "manager": "supervisorctl",
+                    "config": "slack-bridge/supervisord.conf",
+                    "service_name": "ia-services:weather-rewards",
+                },
+                "weather rewards": {
+                    "manager": "supervisorctl",
+                    "config": "slack-bridge/supervisord.conf",
+                    "service_name": "ia-services:weather-rewards",
+                },
+                "slack-monitor": {
+                    "manager": "ps",
+                    "service_name": "slack-monitor",
+                },
+            },
+        )
+        set_config(self.config)
+
+    def tearDown(self):
+        reset_config()
+
+    def test_no_keyword_match_inconclusive(self):
+        """Claims about unknown services should be INCONCLUSIVE."""
+        claim = Claim(
+            text="database server is running",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.result, VerificationResult.INCONCLUSIVE)
+
+    @patch('confab.verify.subprocess.run')
+    def test_claims_running_actually_running_passes(self, mock_run):
+        """Claim says running, process IS running → PASSED."""
+        mock_run.return_value = type('', (), {
+            'stdout': 'ia-services:weather-rewards   RUNNING   pid 12345, uptime 1:00:00',
+            'stderr': '',
+            'returncode': 0,
+        })()
+        claim = Claim(
+            text="Weather rewards monitor: running [v1: verified 2026-03-14]",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
+
+    @patch('confab.verify.subprocess.run')
+    def test_claims_running_actually_stopped_fails(self, mock_run):
+        """Claim says running, process is STOPPED → FAILED."""
+        mock_run.return_value = type('', (), {
+            'stdout': 'ia-services:weather-rewards   STOPPED   Mar 14 07:41 PM',
+            'stderr': '',
+            'returncode': 0,
+        })()
+        claim = Claim(
+            text="Weather rewards monitor: running [v1: verified 2026-03-14]",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.result, VerificationResult.FAILED)
+        self.assertIn("STOPPED", outcome.evidence)
+
+    @patch('confab.verify.subprocess.run')
+    def test_claims_stopped_actually_stopped_passes(self, mock_run):
+        """Claim says stopped, process IS stopped → PASSED."""
+        mock_run.return_value = type('', (), {
+            'stdout': 'ia-services:weather-rewards   STOPPED   Mar 14 07:41 PM',
+            'stderr': '',
+            'returncode': 0,
+        })()
+        claim = Claim(
+            text="weather-rewards: stopped since March 14",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
+
+    @patch('confab.verify.subprocess.run')
+    def test_supervisorctl_not_found(self, mock_run):
+        """Missing supervisorctl should be INCONCLUSIVE, not crash."""
+        mock_run.side_effect = FileNotFoundError("supervisorctl not found")
+        claim = Claim(
+            text="Weather rewards monitor: running",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.result, VerificationResult.INCONCLUSIVE)
+
+    def test_check_supervisorctl_parsing(self):
+        """Test supervisorctl output parsing."""
+        with patch('confab.verify.subprocess.run') as mock_run:
+            mock_run.return_value = type('', (), {
+                'stdout': 'ia-services:weather-rewards   RUNNING   pid 83794, uptime 6 days, 20:43:02',
+                'stderr': '',
+                'returncode': 0,
+            })()
+            status, detail = _check_supervisorctl(
+                "ia-services:weather-rewards", None, Path(self.tmpdir)
+            )
+            self.assertEqual(status, "running")
+
+    def test_check_supervisorctl_stopped(self):
+        with patch('confab.verify.subprocess.run') as mock_run:
+            mock_run.return_value = type('', (), {
+                'stdout': 'ia-services:weather-rewards   STOPPED   Mar 14 07:41 PM',
+                'stderr': '',
+                'returncode': 0,
+            })()
+            status, detail = _check_supervisorctl(
+                "ia-services:weather-rewards", None, Path(self.tmpdir)
+            )
+            self.assertEqual(status, "stopped")
+
+    def test_check_ps_running(self):
+        with patch('confab.verify.subprocess.run') as mock_run:
+            mock_run.return_value = type('', (), {
+                'stdout': '12345\n',
+                'stderr': '',
+                'returncode': 0,
+            })()
+            status, detail = _check_ps("slack-monitor")
+            self.assertEqual(status, "running")
+            self.assertIn("12345", detail)
+
+    def test_check_ps_stopped(self):
+        with patch('confab.verify.subprocess.run') as mock_run:
+            mock_run.return_value = type('', (), {
+                'stdout': '',
+                'stderr': '',
+                'returncode': 1,
+            })()
+            status, detail = _check_ps("nonexistent-process")
+            self.assertEqual(status, "stopped")
+
+    def test_dispatcher_routes_process_status(self):
+        """verify_claim should route PROCESS_STATUS to verify_process_status."""
+        with patch('confab.verify.subprocess.run') as mock_run:
+            mock_run.return_value = type('', (), {
+                'stdout': 'ia-services:weather-rewards   STOPPED   Mar 14',
+                'stderr': '',
+                'returncode': 0,
+            })()
+            claim = Claim(
+                text="Weather rewards monitor: running",
+                claim_type=ClaimType.PROCESS_STATUS,
+                verifiability=VerifiabilityLevel.AUTO,
+            )
+            outcome = verify_claim(claim)
+            self.assertEqual(outcome.result, VerificationResult.FAILED)
+            self.assertEqual(outcome.method, "process_status_check")
 
 
 class TestVerifyClaim(unittest.TestCase):

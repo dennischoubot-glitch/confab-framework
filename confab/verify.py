@@ -476,6 +476,184 @@ def _check_key_in_data(data: Any, key: str) -> bool:
     return True
 
 
+def verify_process_status(claim: Claim) -> VerificationOutcome:
+    """Verify process/service status claims against actual process state.
+
+    Matches keywords in the claim text against configured process_services,
+    then checks the actual process status using the configured manager
+    (supervisorctl, systemd, or ps fallback).
+
+    Examples of claims this catches:
+    - "Weather rewards monitor: running" when service is actually STOPPED
+    - "slack-monitor is operational" when process has crashed
+    """
+    config = get_config()
+    claim_lower = claim.text.lower()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Match longest keyword first to avoid partial matches
+    matched_service = None
+    matched_keyword = None
+    for keyword in sorted(config.process_services.keys(), key=len, reverse=True):
+        if keyword.lower() in claim_lower:
+            matched_service = config.process_services[keyword]
+            matched_keyword = keyword
+            break
+
+    if not matched_service:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="No process service keyword matched in claim text",
+            checked_at=now,
+            method="process_status_check",
+        )
+
+    # Determine what the claim asserts (running vs stopped)
+    positive_words = {'running', 'active', 'operational', 'healthy', 'up'}
+    negative_words = {'stopped', 'inactive', 'down', 'crashed', 'exited', 'fatal', 'backoff'}
+    claims_running = any(w in claim_lower for w in positive_words)
+    claims_stopped = any(w in claim_lower for w in negative_words)
+
+    # Check actual process status
+    manager = matched_service.get("manager", "ps")
+    service_name = matched_service.get("service_name", matched_keyword)
+    actual_status, status_detail = _check_process_status(
+        manager=manager,
+        service_name=service_name,
+        config_path=matched_service.get("config"),
+    )
+
+    evidence = (
+        f"  Matched keyword '{matched_keyword}' → {service_name}\n"
+        f"  Manager: {manager}\n"
+        f"  Actual status: {actual_status}\n"
+        f"  Detail: {status_detail}"
+    )
+
+    # Compare claim against reality
+    is_actually_running = actual_status.lower() in ("running", "active")
+
+    if actual_status == "unknown":
+        result = VerificationResult.INCONCLUSIVE
+    elif claims_running and is_actually_running:
+        result = VerificationResult.PASSED
+    elif claims_stopped and not is_actually_running:
+        result = VerificationResult.PASSED
+    elif claims_running and not is_actually_running:
+        result = VerificationResult.FAILED
+        evidence += f"\n  → Claim says RUNNING but process is {actual_status.upper()}"
+    elif claims_stopped and is_actually_running:
+        result = VerificationResult.FAILED
+        evidence += f"\n  → Claim says STOPPED but process is {actual_status.upper()}"
+    else:
+        result = VerificationResult.INCONCLUSIVE
+        evidence += "\n  → Could not determine claim assertion direction"
+
+    return VerificationOutcome(
+        claim=claim,
+        result=result,
+        evidence=evidence,
+        checked_at=now,
+        method="process_status_check",
+    )
+
+
+def _check_process_status(
+    manager: str,
+    service_name: str,
+    config_path: Optional[str] = None,
+) -> tuple:
+    """Check actual process status using the configured manager.
+
+    Returns (status_string, detail_string).
+    Status is one of: running, stopped, starting, backoff, exited, fatal, unknown.
+    """
+    root = _get_workspace_root()
+
+    if manager == "supervisorctl":
+        return _check_supervisorctl(service_name, config_path, root)
+    elif manager == "systemd":
+        return _check_systemd(service_name)
+    else:
+        return _check_ps(service_name)
+
+
+def _check_supervisorctl(
+    service_name: str,
+    config_path: Optional[str],
+    root: Path,
+) -> tuple:
+    """Check process status via supervisorctl."""
+    cmd = ["supervisorctl"]
+    if config_path:
+        conf = root / config_path if not Path(config_path).is_absolute() else Path(config_path)
+        if conf.exists():
+            cmd.extend(["-c", str(conf)])
+
+    cmd.extend(["status", service_name])
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10,
+        )
+        output = proc.stdout.strip()
+        if not output:
+            output = proc.stderr.strip()
+
+        # Parse supervisorctl output format: "name  STATUS  pid NNN, uptime X:XX:XX"
+        # or "name  STOPPED  Mar 14 07:41 PM"
+        parts = output.split()
+        if len(parts) >= 2:
+            status = parts[1].lower()
+            return (status, output)
+        return ("unknown", output or "No output from supervisorctl")
+    except FileNotFoundError:
+        return ("unknown", "supervisorctl not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "supervisorctl timed out")
+    except Exception as e:
+        return ("unknown", f"Error running supervisorctl: {e}")
+
+
+def _check_systemd(service_name: str) -> tuple:
+    """Check process status via systemctl."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        status = proc.stdout.strip().lower()
+        if status in ("active", "activating"):
+            return ("running", f"systemd: {status}")
+        return (status or "unknown", f"systemd: {status}")
+    except FileNotFoundError:
+        return ("unknown", "systemctl not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "systemctl timed out")
+    except Exception as e:
+        return ("unknown", f"Error running systemctl: {e}")
+
+
+def _check_ps(service_name: str) -> tuple:
+    """Check process status via ps (fallback)."""
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-f", service_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            pids = proc.stdout.strip().split('\n')
+            return ("running", f"Found {len(pids)} process(es): PIDs {', '.join(pids)}")
+        return ("stopped", "No matching process found via pgrep")
+    except FileNotFoundError:
+        return ("unknown", "pgrep not found on PATH")
+    except subprocess.TimeoutExpired:
+        return ("unknown", "pgrep timed out")
+    except Exception as e:
+        return ("unknown", f"Error running pgrep: {e}")
+
+
 def verify_status_by_name(claim: Claim) -> VerificationOutcome:
     """Verify pipeline/service status claims that lack explicit file paths.
 
@@ -999,6 +1177,10 @@ def verify_claim(claim: Claim) -> VerificationOutcome:
         outcome = verify_registry(claim.extracted_paths)
         outcome.claim = claim
         return outcome
+
+    # Process/service status claims — verify against actual process state
+    if claim.claim_type == ClaimType.PROCESS_STATUS:
+        return verify_process_status(claim)
 
     # Pipeline/service status claims without file paths — resolve via name
     if claim.claim_type in (ClaimType.PIPELINE_WORKS, ClaimType.PIPELINE_BLOCKED) and not claim.extracted_paths:

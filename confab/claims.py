@@ -27,6 +27,7 @@ class ClaimType(Enum):
     SCRIPT_RUNS = "script_runs"          # "script X works / runs"
     SCRIPT_BROKEN = "script_broken"      # "script X fails / is broken"
     CONFIG_PRESENT = "config_present"    # "config X is present / configured"
+    PROCESS_STATUS = "process_status"    # "X is running / stopped / operational"
     COUNT_CLAIM = "count_claim"          # "X entries / N items / count of Y"
     STATUS_CLAIM = "status_claim"        # general status assertions
     FACT_CLAIM = "fact_claim"            # factual claims (dates, numbers)
@@ -132,10 +133,26 @@ PIPELINE_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Count/quantity claims
+# Process/service status claims — matches "X service is running", "weather-rewards: RUNNING"
+# More specific than PIPELINE_STATUS_RE: requires a named service/process/monitor
+PROCESS_STATUS_RE = re.compile(
+    r'(?:^|\s)(\S+(?:\s+\S+)?)\s*(?:service|monitor|process|daemon|worker)?\s*'
+    r'(?::|is\s+|:\s+)'
+    r'(?:running|stopped|active|inactive|down|crashed|starting|backoff|exited|fatal|operational|RUNNING|STOPPED)',
+    re.IGNORECASE,
+)
+
+# Count/quantity claims — excludes approximate language (prefixed with ~)
 COUNT_RE = re.compile(
-    r'(\d+)\s+(?:entries|items|posts|notes|files|tests|builds|sprints|days|hours|commits|'
+    r'(?<!~)(?<!\w)(\d+)\s+(?:entries|items|posts|notes|files|tests|builds|sprints|days|hours|commits|'
     r'observations|ideas|principles|scripts|databases|subscribers|views)',
+    re.IGNORECASE,
+)
+
+# Narrative context patterns — lines that describe what happened (past tense),
+# not assertions about current system state. These should not trigger claim extraction.
+NARRATIVE_RE = re.compile(
+    r'^\*{0,2}(?:What happened|This build|Domain note|Domain)\*{0,2}\s*[:—]',
     re.IGNORECASE,
 )
 
@@ -274,6 +291,11 @@ def extract_claims(
         if META_RULE_RE.match(clean_for_rule_check):
             continue
 
+        # Skip narrative/retrospective lines (e.g. "**What happened:** ...")
+        # These describe past events, not current system state assertions.
+        if NARRATIVE_RE.match(clean_for_rule_check):
+            continue
+
         # Extract existing verification tags
         vtag_match = VERIFICATION_TAG_RE.search(line)
         vtag = None
@@ -290,6 +312,15 @@ def extract_claims(
                 if claim:
                     claims.append(claim)
             continue  # Don't double-count
+
+        # --- Process/service status claims (check before pipeline) ---
+        if _is_process_status_claim(line):
+            claim = _classify_process_status_claim(
+                line, source_file, line_num, vtag, current_build_idx
+            )
+            if claim:
+                claims.append(claim)
+            continue
 
         # --- Pipeline/script status claims ---
         if PIPELINE_STATUS_RE.search(line):
@@ -421,6 +452,52 @@ def _extract_config_keys(line: str, file_paths: List[str]) -> List[str]:
                 continue
         keys.append(candidate)
     return keys
+
+
+def _is_process_status_claim(line: str) -> bool:
+    """Check if a line is a process/service status claim.
+
+    Matches patterns like:
+    - "Weather rewards monitor: running"
+    - "weather-rewards: STOPPED"
+    - "slack-monitor is running"
+    - "service X is operational"
+    """
+    lower = line.lower()
+    # Must mention a service/process/monitor concept
+    service_words = {'monitor', 'service', 'process', 'daemon', 'worker', 'rewards', 'server'}
+    status_words = {'running', 'stopped', 'active', 'inactive', 'down',
+                    'crashed', 'starting', 'backoff', 'exited', 'fatal', 'operational'}
+    has_service = any(w in lower for w in service_words)
+    has_status = any(w in lower for w in status_words)
+    if not (has_service and has_status):
+        return False
+    # Exclude lines that are clearly about pipelines (pipeline output checks)
+    pipeline_words = {'pipeline', 'script', 'cron'}
+    if any(w in lower for w in pipeline_words):
+        return False
+    return True
+
+
+def _classify_process_status_claim(
+    line: str,
+    source_file: Optional[str],
+    line_num: int,
+    vtag: Optional[str],
+    build_idx: int,
+) -> Optional[Claim]:
+    """Classify a process/service status claim."""
+    stripped = line.strip()
+    return Claim(
+        text=stripped,
+        claim_type=ClaimType.PROCESS_STATUS,
+        verifiability=VerifiabilityLevel.AUTO,
+        source_file=source_file,
+        source_line=line_num,
+        verification_tag=vtag,
+        extracted_paths=_extract_file_paths(line),
+        age_builds=build_idx,
+    )
 
 
 def _classify_blocker_claim(

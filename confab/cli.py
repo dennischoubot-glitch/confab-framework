@@ -22,6 +22,11 @@ Usage:
     confab prune
     confab prune --verbose  # show dead file references
 
+    # Lint priority files for claim hygiene
+    confab lint
+    confab lint path/to/file.md
+    confab lint --json
+
     # Show tracked claims by staleness (persistent across gate runs)
     confab sweep
     confab sweep --remove-stale  # remove stale claims
@@ -46,6 +51,12 @@ Usage:
     confab check-supports
     confab check-supports --json
     confab check-supports --slack
+
+    # Scan knowledge tree for factual health (expired/perishable/unverified)
+    confab tree
+    confab tree --json
+    confab tree --slack
+    confab tree --stale-days 7
 
     # Comprehensive audit report (tracker DB summary)
     confab audit
@@ -80,6 +91,7 @@ try:
         get_cascade_stats, trace_claim, get_audit_data,
     )
     from .verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
+    from .lint import run_lint
 except ImportError:
     # Running as script directly (python core/confab/cli.py)
     _script_dir = Path(__file__).resolve().parent
@@ -93,6 +105,7 @@ except ImportError:
         get_cascade_stats, trace_claim, get_audit_data,
     )
     from core.confab.verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
+    from core.confab.lint import run_lint
 
 # Lazy import for supports (avoids loading tree JSON at module import time)
 def _get_check_supports():
@@ -101,6 +114,14 @@ def _get_check_supports():
     except ImportError:
         from core.confab.supports import check_supports
     return check_supports
+
+
+def _get_check_tree():
+    try:
+        from .tree import check_tree
+    except ImportError:
+        from core.confab.tree import check_tree
+    return check_tree
 
 
 def cmd_gate(args):
@@ -282,8 +303,9 @@ def cmd_prune(args):
 
 
 def cmd_report(args):
-    """Print a system health dashboard combining gate + supports analysis."""
+    """Print a system health dashboard combining gate + supports + tree analysis."""
     check_supports = _get_check_supports()
+    check_tree = _get_check_tree()
 
     # Run gate
     files = [args.file] if args.file else None
@@ -296,10 +318,18 @@ def cmd_report(args):
         supports_report = None
         supports_error = str(e)
 
+    # Run tree health check
+    try:
+        tree_report = check_tree()
+    except Exception as e:
+        tree_report = None
+        tree_error = str(e)
+
     if args.json:
         result = {
             "gate": gate_report.to_dict(),
             "supports": supports_report.to_dict() if supports_report else {"error": supports_error},
+            "tree": tree_report.to_dict() if tree_report else {"error": tree_error},
         }
         if supports_report:
             total = gate_report.total_claims + supports_report.checked_entries
@@ -315,18 +345,18 @@ def cmd_report(args):
         return
 
     if args.slack:
-        print(_format_health_slack(gate_report, supports_report))
+        print(_format_health_slack(gate_report, supports_report, tree_report))
         if gate_report.has_failures or (supports_report and supports_report.has_zombies):
             sys.exit(1)
         return
 
     # Terminal dashboard
-    print(_format_health_dashboard(gate_report, supports_report))
+    print(_format_health_dashboard(gate_report, supports_report, tree_report))
     if gate_report.has_failures or (supports_report and supports_report.has_zombies):
         sys.exit(1)
 
 
-def _format_health_dashboard(gate_report, supports_report):
+def _format_health_dashboard(gate_report, supports_report, tree_report=None):
     """Format a comprehensive terminal health dashboard."""
     lines = []
     lines.append("=" * 52)
@@ -406,6 +436,38 @@ def _format_health_dashboard(gate_report, supports_report):
                          + ", ".join(w.entry_id for w in supports_report.weakened[:5])
                          + (f" ...+{len(supports_report.weakened) - 5}" if len(supports_report.weakened) > 5 else ""))
 
+    # --- Tree factual health section ---
+    lines.append("")
+    lines.append("-" * 52)
+    lines.append("")
+    lines.append("KNOWLEDGE TREE FACTUAL HEALTH")
+
+    if tree_report is None:
+        lines.append("  (unavailable -- knowledge tree not found)")
+    else:
+        lines.append(f"  Observations: {tree_report.total_observations}  |  "
+                     f"Expired: {len(tree_report.expired)}  |  "
+                     f"Stale-unverified: {len(tree_report.stale_unverified)}  |  "
+                     f"No-TTL: {len(tree_report.perishable_no_ttl)}")
+        lines.append(f"  TTL coverage: {tree_report.ttl_coverage:.1f}%  |  "
+                     f"Verified coverage: {tree_report.verified_coverage:.1f}%")
+
+        if tree_report.expired:
+            lines.append("")
+            lines.append(f"  EXPIRED ({len(tree_report.expired)}):")
+            for e in tree_report.expired[:5]:
+                lines.append(f"    x  {e.entry_id} (expired {e.expires}) -- {e.content[:60]}")
+            if len(tree_report.expired) > 5:
+                lines.append(f"    ...and {len(tree_report.expired) - 5} more")
+
+        if tree_report.stale_unverified:
+            lines.append("")
+            lines.append(f"  STALE UNVERIFIED ({len(tree_report.stale_unverified)}):")
+            for s in tree_report.stale_unverified[:5]:
+                lines.append(f"    ~  {s.entry_id} -- {s.content[:70]}")
+            if len(tree_report.stale_unverified) > 5:
+                lines.append(f"    ...and {len(tree_report.stale_unverified) - 5} more")
+
     # --- Coverage section ---
     lines.append("")
     lines.append("-" * 52)
@@ -426,12 +488,17 @@ def _format_health_dashboard(gate_report, supports_report):
         else:
             lines.append(f"  No claims to verify")
 
+    if tree_report:
+        lines.append(f"  Tree TTL coverage: {tree_report.ttl_coverage:.1f}%")
+
     # --- Overall status ---
     lines.append("")
     lines.append("=" * 52)
 
     has_critical = gate_report.has_failures or (supports_report and supports_report.has_zombies)
-    has_warning = gate_report.has_stale or (supports_report and supports_report.has_issues and not supports_report.has_zombies)
+    has_warning = (gate_report.has_stale
+                   or (supports_report and supports_report.has_issues and not supports_report.has_zombies)
+                   or (tree_report and tree_report.has_expired))
 
     if has_critical:
         status = "CRITICAL"
@@ -446,7 +513,7 @@ def _format_health_dashboard(gate_report, supports_report):
     return "\n".join(lines)
 
 
-def _format_health_slack(gate_report, supports_report):
+def _format_health_slack(gate_report, supports_report, tree_report=None):
     """Format a concise Slack-friendly health report."""
     lines = []
 
@@ -475,6 +542,21 @@ def _format_health_slack(gate_report, supports_report):
                 parts.append(f":warning: {len(supports_report.weakened)} weakened")
             parts.append(f":white_check_mark: {supports_report.healthy} healthy")
             lines.append(" | ".join(parts))
+
+    # Tree factual health
+    if tree_report:
+        if not tree_report.has_issues:
+            lines.append(f":white_check_mark: Tree CLEAN — {tree_report.total_observations} obs, {tree_report.ttl_coverage:.0f}% TTL")
+        else:
+            parts = []
+            if tree_report.expired:
+                parts.append(f":x: {len(tree_report.expired)} expired")
+            if tree_report.stale_unverified:
+                parts.append(f":warning: {len(tree_report.stale_unverified)} stale-unverified")
+            if tree_report.perishable_no_ttl:
+                parts.append(f":hourglass: {len(tree_report.perishable_no_ttl)} no-TTL")
+            lines.append(" | ".join(parts))
+            lines.append(f"TTL coverage: {tree_report.ttl_coverage:.0f}%")
 
     # Coverage
     if supports_report:
@@ -591,6 +673,7 @@ Examples:
   confab extract path/to/priorities.md
   confab quick
   confab prune
+  confab lint
   confab sweep --stats
   confab ci
   confab ci --strict --output report.md
@@ -636,6 +719,12 @@ Examples:
     sweep_parser.add_argument("--stats", action="store_true", help="Show tracker statistics only")
     sweep_parser.add_argument("--history", type=int, nargs="?", const=10, help="Show gate run history (default: 10)")
 
+    # lint
+    lint_parser = subparsers.add_parser("lint", help="Check claim hygiene in priority/handoff files")
+    lint_parser.add_argument("file", nargs="?", help="Specific file to lint (default: files_to_scan from confab.toml)")
+    lint_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    lint_parser.add_argument("--threshold", "-t", type=int, help="Staleness threshold for [unverified] claims (default: 3)")
+
     # check-supports
     supports_parser = subparsers.add_parser(
         "check-supports",
@@ -646,6 +735,16 @@ Examples:
     supports_parser.add_argument("--slack", action="store_true", help="Slack-friendly output")
     supports_parser.add_argument("--fix", action="store_true", help="Auto-invalidate zombie entries (all supports dead)")
     supports_parser.add_argument("--dry-run", action="store_true", help="With --fix: show what would be invalidated without modifying")
+
+    # tree — knowledge tree factual health scan
+    tree_parser = subparsers.add_parser(
+        "tree",
+        help="Scan knowledge tree for factual health issues (expired, perishable, unverified)",
+    )
+    tree_parser.add_argument("--tree", "-t", help="Path to KNOWLEDGE_TREE.json (default: auto-detect)")
+    tree_parser.add_argument("--stale-days", "-s", type=int, help="Days before unverified obs are flagged stale (default: 14)")
+    tree_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    tree_parser.add_argument("--slack", action="store_true", help="Slack-friendly output")
 
     # trace — trace the propagation of a specific claim
     trace_parser = subparsers.add_parser("trace", help="Trace propagation path of a specific claim")
@@ -693,8 +792,12 @@ Examples:
         cmd_report(args)
     elif args.command == "sweep":
         cmd_sweep(args)
+    elif args.command == "lint":
+        cmd_lint(args)
     elif args.command == "check-supports":
         cmd_check_supports(args)
+    elif args.command == "tree":
+        cmd_tree(args)
     elif args.command == "trace":
         cmd_trace(args)
     elif args.command == "cascade":
@@ -735,6 +838,22 @@ def cmd_ci(args):
         sys.exit(1)
     elif report.has_stale and args.strict:
         sys.exit(2)
+
+
+def cmd_lint(args):
+    """Lint priority files for claim hygiene issues."""
+    files = [args.file] if args.file else None
+    threshold = args.threshold or 3
+    report = run_lint(files=files, stale_threshold=threshold)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        print(report.format_report())
+
+    # Exit code: 1 if any errors or warnings found
+    if report.error_count > 0 or report.warning_count > 0:
+        sys.exit(1)
 
 
 def cmd_check_supports(args):
@@ -780,6 +899,23 @@ def cmd_check_supports(args):
         print(report.format_report())
 
     if report.has_zombies:
+        sys.exit(1)
+
+
+def cmd_tree(args):
+    """Scan knowledge tree for factual health issues (expired, perishable, unverified)."""
+    check_tree = _get_check_tree()
+    stale_days = args.stale_days or 14
+    report = check_tree(tree_path=args.tree, stale_days=stale_days)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    elif args.slack:
+        print(report.format_slack())
+    else:
+        print(report.format_report())
+
+    if report.has_expired:
         sys.exit(1)
 
 

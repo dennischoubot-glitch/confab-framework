@@ -40,7 +40,7 @@ exclude_sections = [
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 CONFIG_FILENAME = "confab.toml"
@@ -71,6 +71,51 @@ _IA_PIPELINE_NAMES = {
     "weather rewards": "kalshi_weather_mm.py",
 }
 
+# Process/service status verification configuration.
+# Maps service keyword patterns → verification config.
+_IA_PROCESS_SERVICES: Dict[str, Dict[str, Any]] = {
+    "weather-rewards": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:weather-rewards",
+    },
+    "weather rewards": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:weather-rewards",
+    },
+    "weather monitor": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:weather-rewards",
+    },
+    "slack-monitor": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:slack-monitor",
+    },
+    "slack monitor": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:slack-monitor",
+    },
+    "web-server": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:web-server",
+    },
+    "web server": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:web-server",
+    },
+    "camping-server": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:camping-server",
+    },
+}
+
 _IA_KNOWN_ENV_VARS = {
     'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
     'KALSHI_API_KEY', 'KALSHI_KEY_ID', 'KALSHI_PRIVATE_KEY',
@@ -89,6 +134,7 @@ _IA_EXCLUDE_SECTIONS = [
     r"For Next Dreamer",
     r"Active Tensions",
     r"Settled Stances",
+    r"Previous\s+—",
 ]
 
 # Count verification sources: keyword pattern -> {file, type, count_pattern}
@@ -120,6 +166,7 @@ class ConfabConfig:
     pipeline_names: Dict[str, str] = field(default_factory=dict)
     known_env_vars: Set[str] = field(default_factory=set)
     count_sources: Dict[str, Dict] = field(default_factory=dict)
+    process_services: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     exclude_sections: List[str] = field(default_factory=list)
 
     def __post_init__(self):
@@ -200,6 +247,7 @@ def load_config(
             pipeline_names=dict(_IA_PIPELINE_NAMES),
             known_env_vars=set(_IA_KNOWN_ENV_VARS),
             count_sources=dict(_IA_COUNT_SOURCES),
+            process_services=dict(_IA_PROCESS_SERVICES),
             exclude_sections=list(_IA_EXCLUDE_SECTIONS),
         )
 
@@ -235,6 +283,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
     known = set(env_section.get("known", []))
 
     count_sources = confab.get("count_sources", {})
+    process_services = confab.get("process_services", {})
     exclude_sections = confab.get("exclude_sections", [])
 
     return ConfabConfig(
@@ -246,6 +295,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
         pipeline_names=pipeline_names,
         known_env_vars=known,
         count_sources=count_sources,
+        process_services=process_services,
         exclude_sections=exclude_sections,
     )
 

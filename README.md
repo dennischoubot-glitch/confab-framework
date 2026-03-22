@@ -56,18 +56,47 @@ The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiabili
 
 ## Commands
 
+### Core
+
 | Command | Description |
 |---------|-------------|
-| `confab gate` | Run the full cascade gate |
+| `confab gate` | Run the full cascade gate — extract, verify, track, report |
 | `confab check "text"` | Check inline text for claims |
 | `confab extract file.md` | Extract claims without verifying |
-| `confab quick` | One-line gate summary |
-| `confab prune` | Identify stale build sections to remove |
-| `confab sweep` | Show tracked claims by staleness |
+| `confab quick` | One-line gate summary (for scripts and prompts) |
+| `confab init` | Generate a starter `confab.toml` in the current directory |
+
+### Hygiene
+
+| Command | Description |
+|---------|-------------|
+| `confab lint [file]` | Check claim hygiene — missing verification tags, stale `[unverified]` claims |
+| `confab sweep` | Show tracked claims sorted by staleness |
 | `confab sweep --stats` | Tracker statistics |
-| `confab report` | System health dashboard (gate + supports + coverage) |
+| `confab prune` | Identify stale build sections to remove |
+
+### Diagnostics (Knowledge Tree)
+
+| Command | Description |
+|---------|-------------|
+| `confab tree` | Scan knowledge tree for factual health — expired, perishable, unverified observations |
+| `confab check-supports` | Check for zombie/weakened entries (all or most supports invalidated) |
+| `confab report` | System health dashboard combining gate + supports + coverage |
+
+### Tracing & Audit
+
+| Command | Description |
+|---------|-------------|
+| `confab trace "text"` | Trace propagation path of a specific claim across gate runs |
+| `confab cascade` | Show cascade depth statistics — how far claims propagate |
+| `confab audit` | Comprehensive audit: claims, cascades, resolution rate |
+
+### CI
+
+| Command | Description |
+|---------|-------------|
 | `confab ci` | CI-friendly gate with markdown output and exit codes |
-| `confab init` | Generate a starter `confab.toml` |
+| `confab ci --strict` | Also fail on stale claims (exit code 2) |
 
 ## Configuration
 
@@ -116,6 +145,134 @@ Without a config file, the framework auto-detects context and uses sensible defa
 | `script_runs` | "generate.py works" | `py_compile` + import check |
 | `config_present` | "settings.toml configured" | Parse + key check |
 | `count_claim` | "144 tests passing" | Source-specific count |
+
+## Diagnostics
+
+### `confab lint`
+
+Scans priority and handoff files for claim hygiene issues: missing verification tags (`[unverified]`, `[v1: ...]`, `[v2: ...]`), claims that have lingered at `[unverified]` past the staleness threshold, and formatting problems.
+
+```bash
+confab lint                          # lint all files_to_scan from confab.toml
+confab lint notes/handoff.md         # lint a specific file
+confab lint --threshold 5            # flag [unverified] claims after 5 runs
+confab lint --json                   # machine-readable output
+```
+
+### `confab tree`
+
+Scans a knowledge tree (JSON) for factual health: expired observations past their TTL, perishable facts missing an `expires` date, and unverified observations older than a threshold.
+
+```bash
+confab tree                          # scan with defaults (14-day stale window)
+confab tree --stale-days 7           # tighter window
+confab tree --tree path/to/tree.json # explicit tree path
+```
+
+### `confab check-supports`
+
+Checks knowledge tree entries whose supporting evidence has degraded — entries where most or all supports have been invalidated.
+
+```bash
+confab check-supports                # list weakened entries
+confab check-supports --fix --dry-run  # preview auto-invalidation of zombies
+confab check-supports --fix          # auto-invalidate entries with all supports dead
+```
+
+## Tracing & Audit
+
+### `confab trace`
+
+Traces a specific claim across every gate run it appeared in — when it was first seen, how many runs it persisted, and its verification status at each checkpoint.
+
+```bash
+confab trace "pipeline"              # search by text substring
+confab trace "abc123"                # search by claim hash
+confab trace "OPENAI_API_KEY" --json # machine-readable
+```
+
+### `confab cascade`
+
+Shows how far claims propagate before being verified or removed. High cascade depth means claims are being copied forward without verification — the exact failure mode this framework prevents.
+
+```bash
+confab cascade                       # cascade depth statistics
+confab cascade --json                # machine-readable
+```
+
+### `confab audit`
+
+Comprehensive summary combining claim tracking, cascade analysis, and resolution rates into a single report.
+
+```bash
+confab audit                         # full audit report
+confab audit --json                  # machine-readable
+```
+
+## Examples
+
+### Checking claims in a handoff file
+
+An agent writes a handoff note for the next agent. Before the next agent acts on those claims, the gate checks them against reality:
+
+```bash
+# The handoff file says: "Config deployed at config/prod.toml"
+# and "Blocked on DATABASE_URL"
+confab gate --file notes/handoff.md
+```
+
+If `config/prod.toml` doesn't exist, the gate flags it as `FAILED`. If `DATABASE_URL` is set in the environment, the "blocked" claim is contradicted. The next agent sees the failures before acting on bad information.
+
+### Linting for claim hygiene
+
+Enforce verification discipline across your team's handoff files:
+
+```bash
+confab lint docs/priorities.md
+```
+
+Output flags claims without verification tags:
+
+```
+CONFAB LINT REPORT
+====================================================
+Files scanned: 1
+Claims found:  5
+Issues:        2 (0 errors, 2 warnings, 0 info)
+
+--- docs/priorities.md
+  W line 12: [no-tag] Claim has no verification tag
+  W line 31: [no-tag] Claim has no verification tag
+```
+
+### Monitoring claim propagation over time
+
+Run the gate at every handoff (or on a schedule) and use `cascade` and `audit` to see how claims age:
+
+```bash
+# After several gate runs, check how claims are propagating
+confab cascade
+
+# See the full picture: resolution rate, depth distribution, unresolved claims
+confab audit
+```
+
+A healthy system has a high resolution rate and low cascade depth. Deep cascaders are claims being copied forward without anyone checking them.
+
+### Knowledge tree health check
+
+For systems using a JSON knowledge tree with observations, check factual freshness:
+
+```bash
+# Find expired and unverified observations
+confab tree
+
+# Find entries whose evidence base has eroded
+confab check-supports
+
+# Combined dashboard
+confab report
+```
 
 ## CI Integration
 

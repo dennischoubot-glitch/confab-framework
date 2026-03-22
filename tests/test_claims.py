@@ -22,6 +22,7 @@ from confab.claims import (
     _is_optional_reference,
     _is_config_assertion,
     _extract_config_keys,
+    _is_process_status_claim,
 )
 
 
@@ -448,6 +449,66 @@ class TestSectionExclusion(unittest.TestCase):
         self.assertFalse(any("River Measurement" in t for t in claim_texts))
         # System Status claims SHOULD appear
         self.assertTrue(any("pipeline" in t.lower() for t in claim_texts))
+
+
+class TestProcessStatusDetection(unittest.TestCase):
+    """Test process/service status claim detection."""
+
+    def test_monitor_running(self):
+        self.assertTrue(_is_process_status_claim(
+            "Weather rewards monitor: running [v1: verified 2026-03-14]"
+        ))
+
+    def test_service_stopped(self):
+        self.assertTrue(_is_process_status_claim(
+            "weather-rewards service is stopped"
+        ))
+
+    def test_monitor_operational(self):
+        self.assertTrue(_is_process_status_claim(
+            "Slack monitor is operational"
+        ))
+
+    def test_process_crashed(self):
+        self.assertTrue(_is_process_status_claim(
+            "web server process crashed"
+        ))
+
+    def test_pipeline_not_matched(self):
+        """Pipeline claims should not be classified as process status."""
+        self.assertFalse(_is_process_status_claim(
+            "Notes pipeline is running"
+        ))
+
+    def test_script_not_matched(self):
+        self.assertFalse(_is_process_status_claim(
+            "Script deploy.py is running"
+        ))
+
+    def test_unrelated_text(self):
+        self.assertFalse(_is_process_status_claim(
+            "The journal has 200 entries"
+        ))
+
+    def test_extraction_produces_process_status_type(self):
+        """Extract claims should classify process status as PROCESS_STATUS."""
+        text = "- Weather rewards monitor: running [v1: verified 2026-03-14]"
+        claims = extract_claims(text)
+        process_claims = [c for c in claims if c.claim_type == ClaimType.PROCESS_STATUS]
+        self.assertTrue(len(process_claims) > 0, f"Expected PROCESS_STATUS claim, got: {[c.claim_type for c in claims]}")
+
+    def test_extraction_auto_verifiable(self):
+        text = "Weather rewards monitor: running"
+        claims = extract_claims(text)
+        process_claims = [c for c in claims if c.claim_type == ClaimType.PROCESS_STATUS]
+        self.assertTrue(len(process_claims) > 0)
+        self.assertEqual(process_claims[0].verifiability, VerifiabilityLevel.AUTO)
+
+    def test_service_down_claim(self):
+        text = "- web server: down since yesterday"
+        claims = extract_claims(text)
+        process_claims = [c for c in claims if c.claim_type == ClaimType.PROCESS_STATUS]
+        self.assertTrue(len(process_claims) > 0)
 
 
 class TestExtractClaimsFromFile(unittest.TestCase):
