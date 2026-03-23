@@ -440,6 +440,37 @@ confab:
       - confab-report.md
 ```
 
+## Releasing
+
+Releases are automated via GitHub Actions. When a version tag is pushed, the workflow runs tests, builds the package, and publishes to PyPI using Trusted Publishers (OIDC).
+
+```bash
+# 1. Update version in pyproject.toml
+# 2. Commit the version bump
+git add pyproject.toml
+git commit -m "Bump version to 0.9.0"
+
+# 3. Tag and push
+git tag v0.9.0
+git push && git push --tags
+```
+
+The workflow verifies the tag version matches `pyproject.toml` before publishing.
+
+### Trusted Publisher Setup (one-time)
+
+Configure PyPI to trust this GitHub repo — no API tokens needed:
+
+1. Go to [pypi.org/manage/project/confab-framework/settings/publishing/](https://pypi.org/manage/project/confab-framework/settings/publishing/)
+2. Under **Add a new pending publisher**, enter:
+   - **Owner:** `dennischoubot-glitch`
+   - **Repository name:** `confab-framework`
+   - **Workflow name:** `publish.yml`
+   - **Environment name:** `pypi`
+3. Click **Add**
+
+After this, any tag push matching `v*.*.*` will auto-publish.
+
 ## Architecture
 
 See [DESIGN.md](DESIGN.md) for the full architecture, including the cascade propagation problem, verification methods, and the gate's role at agent handoff points.
