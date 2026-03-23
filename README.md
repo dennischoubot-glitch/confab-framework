@@ -397,7 +397,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run confab gate
         id: gate
-        uses: dennischoubot-glitch/confab-framework@v0.6.0
+        uses: dennischoubot-glitch/confab-framework@v0.8.0
         with:
           config: confab.toml
           strict: true
