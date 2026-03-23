@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Confab — Confabulation Detection Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-raised: #1c2129;
+    --border: #21262d;
+    --border-light: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-dim: #484f58;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --green-dim: rgba(63,185,80,0.15);
+    --red: #f85149;
+    --red-dim: rgba(248,81,73,0.15);
+    --orange: #d29922;
+    --orange-dim: rgba(210,153,34,0.15);
+    --purple: #bc8cff;
+    --purple-dim: rgba(188,140,255,0.15);
+    --cyan: #39d2c0;
+    --cyan-dim: rgba(57,210,192,0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Header */
+  .header {
+    background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 24px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .logo {
+    width: 40px; height: 40px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 18px; color: #fff;
+  }
+  .header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }
+  .header .subtitle { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 500;
+  }
+  .status-badge.healthy { background: var(--green-dim); color: var(--green); }
+  .status-badge.warning { background: var(--orange-dim); color: var(--orange); }
+  .status-badge.critical { background: var(--red-dim); color: var(--red); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-dot.pulse { animation: pulse 2s infinite; }
+  .status-badge.healthy .status-dot { background: var(--green); }
+  .status-badge.warning .status-dot { background: var(--orange); }
+  .status-badge.critical .status-dot { background: var(--red); }
+  .last-scan { font-size: 12px; color: var(--text-dim); }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  /* Layout */
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px 32px; }
+
+  /* Metric Cards */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  .metric-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+  }
+  .metric-card.blue::before { background: var(--accent); }
+  .metric-card.green::before { background: var(--green); }
+  .metric-card.red::before { background: var(--red); }
+  .metric-card.orange::before { background: var(--orange); }
+  .metric-card.purple::before { background: var(--purple); }
+  .metric-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .metric-value { font-size: 32px; font-weight: 700; letter-spacing: -1px; line-height: 1; }
+  .metric-value.blue { color: var(--accent); }
+  .metric-value.green { color: var(--green); }
+  .metric-value.red { color: var(--red); }
+  .metric-value.orange { color: var(--orange); }
+  .metric-value.purple { color: var(--purple); }
+  .metric-detail { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+  .metric-trend { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; margin-top: 6px; padding: 2px 8px; border-radius: 12px; }
+  .metric-trend.up { background: var(--green-dim); color: var(--green); }
+  .metric-trend.down { background: var(--red-dim); color: var(--red); }
+  .metric-trend.neutral { background: rgba(139,148,158,0.1); color: var(--text-muted); }
+
+  /* Chart Panels */
+  .charts-row {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+  }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .panel-title { font-size: 14px; font-weight: 600; }
+  .panel-subtitle { font-size: 12px; color: var(--text-muted); }
+  .chart-container { position: relative; height: 280px; }
+  .chart-container.small { height: 220px; }
+
+  /* Tab Bar */
+  .tabs {
+    display: flex; gap: 0; margin-bottom: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 10px 20px;
+    font-size: 13px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+    background: none;
+    border-top: none; border-left: none; border-right: none;
+    font-family: inherit;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Claims Table */
+  .table-container { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left; padding: 10px 12px;
+    color: var(--text-muted); font-weight: 500;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px; text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  thead th:hover { color: var(--text); }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+  tbody tr:hover { background: var(--surface-raised); }
+  tbody td { padding: 10px 12px; vertical-align: top; }
+  .claim-text {
+    max-width: 500px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .claim-text.expanded { white-space: normal; word-break: break-word; }
+  .claim-text:hover { color: var(--accent); }
+
+  /* Status Pills */
+  .pill {
+    display: inline-flex; align-items: center;
+    padding: 2px 10px; border-radius: 12px;
+    font-size: 11px; font-weight: 500;
+    white-space: nowrap;
+  }
+  .pill.verified { background: var(--green-dim); color: var(--green); }
+  .pill.failed { background: var(--red-dim); color: var(--red); }
+  .pill.stale { background: var(--orange-dim); color: var(--orange); }
+  .pill.inconclusive { background: var(--purple-dim); color: var(--purple); }
+  .pill.new { background: var(--cyan-dim); color: var(--cyan); }
+
+  /* Type Badge */
+  .type-badge {
+    display: inline-flex; padding: 2px 8px;
+    border-radius: 4px; font-size: 11px;
+    background: rgba(139,148,158,0.1);
+    color: var(--text-muted);
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    white-space: nowrap;
+  }
+
+  /* Donut Center */
+  .donut-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .donut-center {
+    position: absolute;
+    text-align: center;
+    pointer-events: none;
+  }
+  .donut-center .big { font-size: 28px; font-weight: 700; color: var(--text); }
+  .donut-center .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+
+  /* Legend */
+  .legend { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+  .legend-count { margin-left: auto; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* Bottom Grid */
+  .bottom-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  /* Source list */
+  .source-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .source-item:last-child { border-bottom: none; }
+  .source-name { font-size: 13px; font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; color: var(--accent); }
+  .source-bar-wrap { flex: 1; margin: 0 16px; height: 6px; background: rgba(139,148,158,0.1); border-radius: 3px; }
+  .source-bar { height: 100%; border-radius: 3px; background: var(--accent); transition: width 0.5s ease; }
+  .source-count { font-size: 13px; font-weight: 600; color: var(--text-muted); min-width: 30px; text-align: right; }
+
+  /* Claim type grid */
+  .type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .type-card {
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .type-card .name {
+    font-size: 12px;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    color: var(--accent);
+  }
+  .type-card .count { font-size: 20px; font-weight: 700; }
+  .type-card .pct { font-size: 11px; color: var(--text-muted); }
+
+  /* Empty state */
+  .empty-state { text-align: center; padding: 40px; color: var(--text-muted); }
+  .empty-state .icon { font-size: 40px; margin-bottom: 12px; opacity: 0.3; }
+
+  /* Filter bar */
+  .filter-bar {
+    display: flex; gap: 8px; align-items: center;
+    padding: 12px 0;
+  }
+  .filter-chip {
+    padding: 4px 12px; border-radius: 16px;
+    font-size: 12px; cursor: pointer;
+    background: rgba(139,148,158,0.1);
+    color: var(--text-muted);
+    border: 1px solid transparent;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .filter-chip:hover { border-color: var(--border-light); color: var(--text); }
+  .filter-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .filter-chip .count-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 18px; border-radius: 9px;
+    font-size: 10px; font-weight: 600; margin-left: 4px;
+    background: rgba(0,0,0,0.2);
+  }
+
+  /* Responsive */
+  @media (max-width: 1200px) {
+    .metrics-grid { grid-template-columns: repeat(3, 1fr); }
+    .charts-row { grid-template-columns: 1fr; }
+    .bottom-grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 768px) {
+    .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+    .container { padding: 16px; }
+    .header { padding: 16px; flex-direction: column; gap: 12px; }
+  }
+
+  /* Tooltip */
+  .info-tip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    cursor: help;
+    color: var(--text-dim);
+    margin-left: 6px;
+  }
+  .info-tip:hover .tip-text { display: block; }
+  .tip-text {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface-raised);
+    border: 1px solid var(--border-light);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+
+  /* Insight card */
+  .insight-card {
+    background: rgba(88,166,255,0.06);
+    border: 1px solid rgba(88,166,255,0.15);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .insight-icon { font-size: 18px; flex-shrink: 0; margin-top: 1px; }
+  .insight-text { font-size: 13px; line-height: 1.5; color: var(--text-muted); }
+  .insight-text strong { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">C</div>
+    <div>
+      <h1>Confab</h1>
+      <div class="subtitle">Confabulation Detection &amp; Prevention</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <span class="last-scan" id="lastScan"></span>
+    <span class="status-badge" id="statusBadge">
+      <span class="status-dot pulse"></span>
+      <span id="statusText"></span>
+    </span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Insight Banner -->
+  <div class="insight-card" id="insightCard">
+    <span class="insight-icon">&#9432;</span>
+    <span class="insight-text" id="insightText"></span>
+  </div>
+
+  <!-- Metric Cards -->
+  <div class="metrics-grid">
+    <div class="metric-card blue">
+      <div class="metric-label">Total Claims Tracked</div>
+      <div class="metric-value blue" id="metricTotal">--</div>
+      <div class="metric-detail" id="metricTotalDetail"></div>
+    </div>
+    <div class="metric-card green">
+      <div class="metric-label">Verification Rate</div>
+      <div class="metric-value green" id="metricVerified">--</div>
+      <div class="metric-detail" id="metricVerifiedDetail"></div>
+    </div>
+    <div class="metric-card red">
+      <div class="metric-label">Confabulations Caught</div>
+      <div class="metric-value red" id="metricFailed">--</div>
+      <div class="metric-detail" id="metricFailedDetail"></div>
+    </div>
+    <div class="metric-card orange">
+      <div class="metric-label">Stale Claims</div>
+      <div class="metric-value orange" id="metricStale">--</div>
+      <div class="metric-detail" id="metricStaleDetail"></div>
+    </div>
+    <div class="metric-card purple">
+      <div class="metric-label">Gate Runs (24h)</div>
+      <div class="metric-value purple" id="metricRuns">--</div>
+      <div class="metric-detail" id="metricRunsDetail"></div>
+    </div>
+  </div>
+
+  <!-- Charts Row -->
+  <div class="charts-row">
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Gate Run Timeline</div>
+          <div class="panel-subtitle">Claims scanned, verified, and flagged over time</div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <canvas id="timelineChart"></canvas>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Claim Status Distribution</div>
+          <div class="panel-subtitle">Current state of all tracked claims</div>
+        </div>
+      </div>
+      <div class="donut-wrapper">
+        <div class="chart-container small">
+          <canvas id="statusChart"></canvas>
+        </div>
+        <div class="donut-center">
+          <div class="big" id="donutCenter">--</div>
+          <div class="label">Coverage</div>
+        </div>
+      </div>
+      <div class="legend" id="statusLegend"></div>
+    </div>
+  </div>
+
+  <!-- Bottom Grid: Source + Types -->
+  <div class="bottom-grid">
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Claims by Source</div>
+          <div class="panel-subtitle">Which files produce the most claims</div>
+        </div>
+      </div>
+      <div id="sourceList"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Claim Types</div>
+          <div class="panel-subtitle">Classification of tracked claims</div>
+        </div>
+      </div>
+      <div class="type-grid" id="typeGrid"></div>
+    </div>
+  </div>
+
+  <!-- Claims Table -->
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <div class="panel-title">All Tracked Claims</div>
+        <div class="panel-subtitle" id="tableSubtitle"></div>
+      </div>
+    </div>
+    <div class="filter-bar" id="filterBar"></div>
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th onclick="sortTable('status')">Status</th>
+            <th onclick="sortTable('claim_type')">Type</th>
+            <th onclick="sortTable('claim_text')">Claim</th>
+            <th onclick="sortTable('source_file')">Source</th>
+            <th onclick="sortTable('run_count')">Runs</th>
+            <th onclick="sortTable('first_seen')">First Seen</th>
+            <th onclick="sortTable('last_seen')">Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="claimsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// === DATA (embedded from confab_tracker.db) ===
+const claims = [{"claim_hash": "abc123", "claim_text": "All 42 tests pass.", "claim_type": "count_claim", "source_file": "priorities.md", "first_seen": "2026-03-20T10:00:00Z", "last_seen": "2026-03-20T22:00:00Z", "last_verified": "2026-03-20T22:00:00Z", "run_count": 12, "status": "verified", "evidence": null}, {"claim_hash": "def456", "claim_text": "Deploy pipeline operational.", "claim_type": "pipeline_works", "source_file": "handoff.md", "first_seen": "2026-03-20T08:00:00Z", "last_seen": "2026-03-20T22:00:00Z", "last_verified": "2026-03-20T22:00:00Z", "run_count": 30, "status": "verified", "evidence": null}, {"claim_hash": "ghi789", "claim_text": "Database migration needs POSTGRES_URL", "claim_type": "pipeline_blocked", "source_file": "priorities.md", "first_seen": "2026-03-20T14:00:00Z", "last_seen": "2026-03-20T22:00:00Z", "last_verified": null, "run_count": 5, "status": "stale", "evidence": null}, {"claim_hash": "jkl012", "claim_text": "Coverage at 95% after refactor.", "claim_type": "count_claim", "source_file": "priorities.md", "first_seen": "2026-03-20T18:00:00Z", "last_seen": "2026-03-20T22:00:00Z", "last_verified": null, "run_count": 3, "status": "failed", "evidence": "Count mismatch: actual coverage is 87%"}];
+
+const gateRuns = [{"id": 1, "timestamp": "2026-03-20T10:00:00Z", "total_claims": 4, "passed": 2, "failed": 1, "stale": 1, "new_claims": 0, "returning_claims": 4}, {"id": 2, "timestamp": "2026-03-20T11:00:00Z", "total_claims": 4, "passed": 3, "failed": 0, "stale": 1, "new_claims": 1, "returning_claims": 3}, {"id": 3, "timestamp": "2026-03-20T12:00:00Z", "total_claims": 4, "passed": 2, "failed": 1, "stale": 1, "new_claims": 2, "returning_claims": 2}, {"id": 4, "timestamp": "2026-03-20T13:00:00Z", "total_claims": 4, "passed": 3, "failed": 0, "stale": 1, "new_claims": 0, "returning_claims": 4}, {"id": 5, "timestamp": "2026-03-20T14:00:00Z", "total_claims": 4, "passed": 2, "failed": 1, "stale": 1, "new_claims": 1, "returning_claims": 3}, {"id": 6, "timestamp": "2026-03-20T15:00:00Z", "total_claims": 4, "passed": 3, "failed": 0, "stale": 1, "new_claims": 2, "returning_claims": 2}, {"id": 7, "timestamp": "2026-03-20T16:00:00Z", "total_claims": 4, "passed": 2, "failed": 1, "stale": 1, "new_claims": 0, "returning_claims": 4}, {"id": 8, "timestamp": "2026-03-20T17:00:00Z", "total_claims": 4, "passed": 3, "failed": 0, "stale": 1, "new_claims": 1, "returning_claims": 3}, {"id": 9, "timestamp": "2026-03-20T18:00:00Z", "total_claims": 4, "passed": 2, "failed": 1, "stale": 1, "new_claims": 2, "returning_claims": 2}, {"id": 10, "timestamp": "2026-03-20T19:00:00Z", "total_claims": 4, "passed": 3, "failed": 0, "stale": 1, "new_claims": 0, "returning_claims": 4}];
+
+// === COMPUTED STATE ===
+let activeFilter = 'all';
+let sortKey = 'status';
+let sortDir = 'asc';
+const statusOrder = { failed: 0, stale: 1, inconclusive: 2, verified: 3, new: 4 };
+const statusColors = {
+  verified: '#3fb950', failed: '#f85149', stale: '#d29922',
+  inconclusive: '#bc8cff', new: '#39d2c0'
+};
+const statusLabels = {
+  verified: 'Verified', failed: 'Failed', stale: 'Stale',
+  inconclusive: 'Inconclusive', new: 'New'
+};
+
+// === COMPUTE METRICS ===
+function computeMetrics() {
+  const total = claims.length;
+  const byStatus = {};
+  claims.forEach(c => { byStatus[c.status] = (byStatus[c.status] || 0) + 1; });
+
+  const verified = byStatus.verified || 0;
+  const failed = byStatus.failed || 0;
+  const stale = byStatus.stale || 0;
+  const inconclusive = byStatus.inconclusive || 0;
+
+  const verificationRate = total > 0 ? Math.round((verified / total) * 100) : 0;
+  const coverageRate = total > 0 ? Math.round(((verified + failed) / total) * 100) : 0;
+
+  return { total, verified, failed, stale, inconclusive, verificationRate, coverageRate, byStatus };
+}
+
+// === RENDER ===
+function render() {
+  const m = computeMetrics();
+
+  // Status badge
+  const badge = document.getElementById('statusBadge');
+  const statusText = document.getElementById('statusText');
+  if (m.failed > 3) {
+    badge.className = 'status-badge critical';
+    statusText.textContent = 'Needs Attention';
+  } else if (m.stale > 5 || m.failed > 0) {
+    badge.className = 'status-badge warning';
+    statusText.textContent = 'Warning';
+  } else {
+    badge.className = 'status-badge healthy';
+    statusText.textContent = 'Healthy';
+  }
+
+  // Last scan
+  const lastRun = gateRuns[0];
+  if (lastRun) {
+    const d = new Date(lastRun.timestamp);
+    document.getElementById('lastScan').textContent = 'Last scan: ' + d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  }
+
+  // Insight
+  const insightEl = document.getElementById('insightText');
+  if (m.failed > 0) {
+    insightEl.innerHTML = `<strong>${m.failed} confabulation${m.failed > 1 ? 's' : ''} detected.</strong> These are claims that agents stated as fact but contradicted observable reality when auto-verified. Each prevented a false claim from propagating to downstream agents.`;
+  } else if (m.stale > 5) {
+    insightEl.innerHTML = `<strong>${m.stale} claims aging without verification.</strong> These claims have persisted through ${Math.min(...claims.filter(c => c.status === 'stale').map(c => c.run_count))}+ gate runs without being auto-verified or pruned. Stale claims are the precursor to confabulation cascades.`;
+  } else {
+    insightEl.innerHTML = `<strong>System is healthy.</strong> ${m.verified} claims verified against reality, ${m.coverageRate}% of all claims have been definitively resolved (verified or caught). The confabulation gate is running every hour and catching false claims before they propagate.`;
+  }
+
+  // Metrics
+  document.getElementById('metricTotal').textContent = m.total;
+  document.getElementById('metricTotalDetail').textContent = `${gateRuns.length} gate runs today`;
+  document.getElementById('metricVerified').textContent = m.verificationRate + '%';
+  document.getElementById('metricVerifiedDetail').textContent = `${m.verified} of ${m.total} claims verified`;
+  document.getElementById('metricFailed').textContent = m.failed;
+  document.getElementById('metricFailedDetail').textContent = 'False claims caught by auto-verification';
+  document.getElementById('metricStale').textContent = m.stale;
+  document.getElementById('metricStaleDetail').textContent = 'Claims aging without verification';
+  document.getElementById('metricRuns').textContent = gateRuns.length;
+  document.getElementById('metricRunsDetail').textContent = `Avg ${(gateRuns.reduce((s, r) => s + r.total_claims, 0) / gateRuns.length).toFixed(1)} claims/run`;
+
+  // Donut center
+  document.getElementById('donutCenter').textContent = m.coverageRate + '%';
+
+  renderTimeline();
+  renderStatusDonut(m);
+  renderSources();
+  renderTypes(m);
+  renderFilters(m);
+  renderTable();
+}
+
+// === TIMELINE CHART ===
+let timelineChart = null;
+function renderTimeline() {
+  const ctx = document.getElementById('timelineChart').getContext('2d');
+  if (timelineChart) timelineChart.destroy();
+
+  // Deduplicate runs that are too close together (< 5 min)
+  const filtered = [];
+  let last = null;
+  for (const r of [...gateRuns].reverse()) {
+    if (!last || new Date(r.timestamp) - new Date(last.timestamp) > 300000) {
+      filtered.push(r);
+      last = r;
+    }
+  }
+
+  const labels = filtered.map(r => new Date(r.timestamp));
+  timelineChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Total Claims',
+          data: filtered.map(r => r.total_claims),
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          fill: true,
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        },
+        {
+          label: 'Passed',
+          data: filtered.map(r => r.passed),
+          borderColor: '#3fb950',
+          backgroundColor: 'rgba(63,185,80,0.08)',
+          fill: true,
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        },
+        {
+          label: 'Failed',
+          data: filtered.map(r => r.failed),
+          borderColor: '#f85149',
+          backgroundColor: 'rgba(248,81,73,0.08)',
+          fill: true,
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        },
+        {
+          label: 'Stale',
+          data: filtered.map(r => r.stale),
+          borderColor: '#d29922',
+          backgroundColor: 'rgba(210,153,34,0.08)',
+          fill: true,
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: { color: '#8b949e', boxWidth: 12, padding: 16, font: { size: 11 } }
+        },
+        tooltip: {
+          backgroundColor: '#1c2129',
+          borderColor: '#30363d',
+          borderWidth: 1,
+          titleColor: '#e6edf3',
+          bodyColor: '#8b949e',
+          padding: 10,
+          callbacks: {
+            title: items => {
+              const d = new Date(items[0].parsed.x);
+              return d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: 'hour', displayFormats: { hour: 'ha' } },
+          grid: { color: 'rgba(48,54,61,0.4)' },
+          ticks: { color: '#484f58', font: { size: 11 } },
+          border: { color: '#21262d' }
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: 'rgba(48,54,61,0.4)' },
+          ticks: { color: '#484f58', font: { size: 11 }, stepSize: 1 },
+          border: { color: '#21262d' }
+        }
+      }
+    }
+  });
+}
+
+// === STATUS DONUT ===
+let statusChart = null;
+function renderStatusDonut(m) {
+  const ctx = document.getElementById('statusChart').getContext('2d');
+  if (statusChart) statusChart.destroy();
+
+  const statuses = ['verified', 'failed', 'stale', 'inconclusive'];
+  const data = statuses.map(s => m.byStatus[s] || 0);
+  const colors = statuses.map(s => statusColors[s]);
+
+  statusChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: statuses.map(s => statusLabels[s]),
+      datasets: [{
+        data,
+        backgroundColor: colors,
+        borderColor: '#161b22',
+        borderWidth: 3,
+        hoverOffset: 6
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '65%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1c2129',
+          borderColor: '#30363d',
+          borderWidth: 1,
+          titleColor: '#e6edf3',
+          bodyColor: '#8b949e',
+          callbacks: {
+            label: item => `${item.label}: ${item.raw} claim${item.raw !== 1 ? 's' : ''}`
+          }
+        }
+      }
+    }
+  });
+
+  // Legend
+  const legendEl = document.getElementById('statusLegend');
+  legendEl.innerHTML = statuses.map(s => `
+    <div class="legend-item">
+      <span class="legend-dot" style="background:${statusColors[s]}"></span>
+      <span>${statusLabels[s]}</span>
+      <span class="legend-count">${m.byStatus[s] || 0}</span>
+    </div>
+  `).join('');
+}
+
+// === SOURCES ===
+function renderSources() {
+  const sourceMap = {};
+  claims.forEach(c => {
+    const src = c.source_file;
+    if (!sourceMap[src]) sourceMap[src] = { total: 0, failed: 0, stale: 0, verified: 0 };
+    sourceMap[src].total++;
+    if (c.status === 'failed') sourceMap[src].failed++;
+    if (c.status === 'stale') sourceMap[src].stale++;
+    if (c.status === 'verified') sourceMap[src].verified++;
+  });
+
+  const maxCount = Math.max(...Object.values(sourceMap).map(s => s.total));
+  const el = document.getElementById('sourceList');
+  el.innerHTML = Object.entries(sourceMap)
+    .sort((a, b) => b[1].total - a[1].total)
+    .map(([name, stats]) => `
+      <div class="source-item">
+        <span class="source-name">${name}</span>
+        <div class="source-bar-wrap">
+          <div class="source-bar" style="width:${(stats.total / maxCount * 100)}%"></div>
+        </div>
+        <span class="source-count">${stats.total}</span>
+      </div>
+    `).join('');
+}
+
+// === TYPES ===
+function renderTypes(m) {
+  const typeMap = {};
+  claims.forEach(c => { typeMap[c.claim_type] = (typeMap[c.claim_type] || 0) + 1; });
+  const el = document.getElementById('typeGrid');
+  el.innerHTML = Object.entries(typeMap)
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, count]) => `
+      <div class="type-card">
+        <span class="name">${type}</span>
+        <span class="count">${count}</span>
+        <span class="pct">${Math.round(count / m.total * 100)}% of claims</span>
+      </div>
+    `).join('');
+}
+
+// === FILTERS ===
+function renderFilters(m) {
+  const statuses = ['all', 'failed', 'stale', 'inconclusive', 'verified'];
+  const counts = { all: m.total, ...m.byStatus };
+  const el = document.getElementById('filterBar');
+  el.innerHTML = statuses.map(s => `
+    <button class="filter-chip ${activeFilter === s ? 'active' : ''}" onclick="setFilter('${s}')">
+      ${s === 'all' ? 'All' : statusLabels[s]}
+      <span class="count-badge">${counts[s] || 0}</span>
+    </button>
+  `).join('');
+}
+
+function setFilter(f) {
+  activeFilter = f;
+  const m = computeMetrics();
+  renderFilters(m);
+  renderTable();
+}
+
+// === TABLE ===
+function sortTable(key) {
+  if (sortKey === key) {
+    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    sortKey = key;
+    sortDir = 'asc';
+  }
+  renderTable();
+}
+
+function renderTable() {
+  let filtered = activeFilter === 'all' ? [...claims] : claims.filter(c => c.status === activeFilter);
+
+  filtered.sort((a, b) => {
+    let va = a[sortKey], vb = b[sortKey];
+    if (sortKey === 'status') { va = statusOrder[va] ?? 5; vb = statusOrder[vb] ?? 5; }
+    if (sortKey === 'run_count') { va = Number(va); vb = Number(vb); }
+    if (va < vb) return sortDir === 'asc' ? -1 : 1;
+    if (va > vb) return sortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  document.getElementById('tableSubtitle').textContent = `Showing ${filtered.length} of ${claims.length} claims`;
+
+  const body = document.getElementById('claimsBody');
+  body.innerHTML = filtered.map(c => {
+    const firstSeen = new Date(c.first_seen);
+    const lastSeen = new Date(c.last_seen);
+    const fmtDate = d => d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+    return `<tr>
+      <td><span class="pill ${c.status}">${statusLabels[c.status] || c.status}</span></td>
+      <td><span class="type-badge">${c.claim_type}</span></td>
+      <td><span class="claim-text" onclick="this.classList.toggle('expanded')">${escHtml(c.claim_text)}</span></td>
+      <td style="white-space:nowrap;color:var(--text-muted);font-size:12px">${c.source_file}</td>
+      <td style="text-align:center;font-variant-numeric:tabular-nums">${c.run_count}</td>
+      <td style="white-space:nowrap;color:var(--text-muted);font-size:12px">${fmtDate(firstSeen)}</td>
+      <td style="white-space:nowrap;color:var(--text-muted);font-size:12px">${fmtDate(lastSeen)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// === INIT ===
+render();
+</script>
+
+</body>
+</html>

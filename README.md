@@ -48,6 +48,40 @@ for o in outcomes:
     print(f"{o.result.value}: {o.evidence}")
 ```
 
+### Decorator Middleware
+
+Wrap any agent function with `@confab_gate` to auto-verify its output:
+
+```python
+from confab import confab_gate
+
+@confab_gate
+def my_agent(prompt: str) -> str:
+    return "Config at config/prod.toml is ready. Blocked on DATABASE_URL."
+
+# On call, the decorator extracts claims from the return value,
+# verifies them against reality, and warns on failures.
+result = my_agent("check status")
+```
+
+Modes:
+- `@confab_gate` — warn on failures (default)
+- `@confab_gate(on_fail="raise")` — raise `ConfabVerificationError` on failures
+- `@confab_gate(on_fail="log")` — log quietly, for production
+
+Options: `check_files=True`, `check_env=True` to control what gets verified.
+
+See `examples/middleware_example.py` for a complete walkthrough.
+
+### Standalone text verification
+
+```python
+from confab.middleware import verify_text
+
+report = verify_text("The model at /models/latest.bin is loaded.")
+print(report.summary())
+```
+
 ## How It Works
 
 Agents in multi-agent systems pass claims forward at handoff points — "the pipeline is blocked on X," "file Y exists," "the config is ready." When an agent states a falsehood confidently, the next agent copies it forward. The confab framework breaks this cascade by extracting claims from handoff text, auto-verifying them against reality (filesystem, environment variables, script syntax, config parsing, pipeline outputs), and tracking how long unverified claims persist. Claims that fail verification get flagged; claims that linger without verification get marked stale. The gate runs at every agent handoff point, supplying the oracle bits that distinguish confabulation from understanding.
@@ -145,6 +179,13 @@ Without a config file, the framework auto-detects context and uses sensible defa
 | `script_runs` | "generate.py works" | `py_compile` + import check |
 | `config_present` | "settings.toml configured" | Parse + key check |
 | `count_claim` | "144 tests passing" | Source-specific count |
+| `process_status` | "monitor STOPPED since Mar 14" | `supervisorctl` / `systemd` / `pgrep` |
+
+### Behavior Claim TTL
+
+Transient claims about runtime state (API responses, process status, pipeline outputs) go stale faster than structural claims. The gate auto-expires behavior claims after 6 hours — if a claim's verification tag is older than the TTL, it's flagged for re-verification rather than trusted blindly.
+
+This catches the pattern where "pipeline is working [v1: verified yesterday]" persists in a handoff file long after the pipeline broke.
 
 ## Diagnostics
 
@@ -211,6 +252,21 @@ confab audit --json                  # machine-readable
 
 ## Examples
 
+### Multi-agent cascade demo
+
+A self-contained demo simulating a three-agent sprint cycle with the confab gate running at each handoff:
+
+```bash
+pip install confab-framework
+python -m confab.examples.multi_agent_demo
+```
+
+The demo shows:
+1. **Claim extraction** from natural language handoff text
+2. **Auto-verification** catching false file/env claims before they cascade
+3. **Cascade tracking** — how unverified claims age across builds
+4. **High-level API** usage with `ConfabGate` and `ConfabConfig`
+
 ### Checking claims in a handoff file
 
 An agent writes a handoff note for the next agent. Before the next agent acts on those claims, the gate checks them against reality:
@@ -276,56 +332,98 @@ confab report
 
 ## CI Integration
 
+Add claim verification to your CI in 5 minutes.
+
+### Option 1: Copy-paste workflow (simplest)
+
+Copy this into `.github/workflows/confab-gate.yml` in your repo:
+
+```yaml
+name: Confab Gate
+on:
+  pull_request:
+    paths: ['docs/**', 'notes/**', '**/*.md']
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install confab-framework
+      - name: Run confab gate
+        run: confab ci --no-track --strict --output report.md
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: report.md
+```
+
+That's it. Every PR that touches markdown files gets claim verification with results posted as a comment.
+
+### Option 2: Reusable workflow (multi-repo)
+
+Reference the workflow directly — no file to copy or maintain:
+
+```yaml
+name: Confab Gate
+on:
+  pull_request:
+    paths: ['docs/**', '**/*.md']
+
+jobs:
+  confab:
+    uses: dennischoubot-glitch/confab-framework/.github/workflows/confab-gate.yml@main
+    with:
+      strict: true
+```
+
+### Option 3: Composite action (custom integration)
+
+Use the action directly for more control over the pipeline:
+
+```yaml
+jobs:
+  confab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run confab gate
+        id: gate
+        uses: dennischoubot-glitch/confab-framework@v0.6.0
+        with:
+          config: confab.toml
+          strict: true
+          stale-threshold: 3
+      - name: Use results
+        if: always()
+        run: echo "Status=${{ steps.gate.outputs.status }} Failed=${{ steps.gate.outputs.failed }}"
+```
+
+The action installs confab-framework from PyPI, runs `confab ci`, and posts the markdown report as a PR comment.
+
 ### `confab ci` command
 
-Run the gate in CI pipelines with proper exit codes and markdown output:
+Run the gate directly in any CI pipeline:
 
 ```bash
-# Basic — exits 1 on failures, 0 otherwise
-confab ci
-
-# Strict — also exits 2 on stale claims
-confab ci --strict
-
-# Write markdown report to file (for PR comments)
-confab ci --output report.md
-
-# Skip tracker DB persistence (stateless CI runs)
-confab ci --no-track
+confab ci                        # exits 1 on failures, 0 otherwise
+confab ci --strict               # also exits 2 on stale claims
+confab ci --output report.md     # write markdown report for PR comments
+confab ci --no-track             # skip tracker DB (stateless CI runs)
 ```
 
 Exit codes:
 - `0` — clean (all claims verified, no stale)
 - `1` — failures (claims contradict reality)
 - `2` — stale claims only (with `--strict`)
-
-### GitHub Action
-
-Add confab to your CI pipeline with the GitHub Action:
-
-```yaml
-name: Confab Gate
-on:
-  pull_request:
-    paths:
-      - 'docs/**'
-      - 'notes/**'
-
-jobs:
-  confab:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run confab gate
-        uses: dennischoubot-glitch/confab-framework@v0.4.0
-        with:
-          config: confab.toml        # optional, auto-detected
-          strict: true               # fail on stale claims too
-          stale-threshold: 3         # runs before flagging stale
-```
-
-The action installs confab-framework from PyPI, runs `confab ci`, and posts the markdown report as a PR comment.
 
 ### Generic CI (GitLab, CircleCI, etc.)
 
@@ -335,7 +433,7 @@ confab:
   image: python:3.12
   script:
     - pip install confab-framework
-    - confab ci --strict
+    - confab ci --strict --output confab-report.md
   artifacts:
     when: always
     paths:

@@ -68,9 +68,10 @@ class VerificationOutcome:
 def _resolve_path(path_str: str) -> Path:
     """Resolve a path relative to workspace root.
 
-    If direct resolution fails and the path has no directory component,
-    search first-level subdirectories. This handles claims like
-    'scheduler.py' when the actual file is at 'slack-bridge/scheduler.py'.
+    If direct resolution fails, search the repo by filename via rglob.
+    For paths with directory components (e.g. 'examples/__init__.py'),
+    filter to suffix matches. Handles both bare filenames like
+    'scheduler.py' and nested paths like 'examples/__init__.py'.
     """
     root = _get_workspace_root()
     p = Path(path_str)
@@ -81,22 +82,30 @@ def _resolve_path(path_str: str) -> Path:
     if direct.exists():
         return direct
 
-    # Only search subdirectories for bare filenames (no directory component)
-    if '/' not in path_str and '\\' not in path_str:
-        skip = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.mypy_cache',
-                '.egg-info', '.tox', '.pytest_cache'}
-        matches = list(root.rglob(path_str))
-        # Filter out matches inside skipped directories
-        matches = [
-            m for m in matches
-            if not any(part in skip or part.startswith('.') for part in m.relative_to(root).parts[:-1])
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        elif len(matches) > 1:
-            # Multiple matches — return first but caller should handle ambiguity
-            # Log for debugging: multiple candidates found
-            return matches[0]
+    # Search repo for the path — handles both bare filenames and relative paths
+    # with directory components (e.g. "examples/__init__.py" matching
+    # "core/confab/examples/__init__.py")
+    skip = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.mypy_cache',
+            '.egg-info', '.tox', '.pytest_cache', 'build', 'dist'}
+
+    # Search by filename, then filter to those whose path ends with the full relative path
+    filename = p.name
+    matches = list(root.rglob(filename))
+    matches = [
+        m for m in matches
+        if not any(part in skip or part.startswith('.') for part in m.relative_to(root).parts[:-1])
+    ]
+    # For paths with directory components, filter to suffix matches
+    if '/' in path_str or '\\' in path_str:
+        suffix_matches = [m for m in matches if str(m).endswith(path_str)]
+        if suffix_matches:
+            matches = suffix_matches
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        # Multiple matches — return first but caller should handle ambiguity
+        return matches[0]
 
     # Return the direct path even if it doesn't exist (caller checks existence)
     return direct
@@ -491,11 +500,17 @@ def verify_process_status(claim: Claim) -> VerificationOutcome:
     claim_lower = claim.text.lower()
     now = datetime.now(timezone.utc).isoformat()
 
+    # Normalize dashes/spaces for matching — "weather-rewards" and "weather rewards"
+    # should both match claims containing either variant. This prevents variant drift
+    # where config has one form and claim text uses the other.
+    claim_normalized = claim_lower.replace('-', ' ')
+
     # Match longest keyword first to avoid partial matches
     matched_service = None
     matched_keyword = None
     for keyword in sorted(config.process_services.keys(), key=len, reverse=True):
-        if keyword.lower() in claim_lower:
+        keyword_normalized = keyword.lower().replace('-', ' ')
+        if keyword_normalized in claim_normalized:
             matched_service = config.process_services[keyword]
             matched_keyword = keyword
             break
@@ -978,27 +993,8 @@ def _verify_regex_count(
         )
 
 
-def _verify_test_count(
-    claim: Claim, root: Path, now: str,
-) -> VerificationOutcome:
-    """Verify test count claims by counting test functions.
-
-    Scope-aware: if the claim mentions a specific component (e.g. "confab tests",
-    "synthesis tests"), searches for a tests/ directory under that component first.
-    Falls back to the workspace-level tests/ directory.
-    """
-    test_dir = _find_scoped_test_dir(claim.text, root)
-    scope_label = str(test_dir.relative_to(root)) if test_dir else "tests/"
-
-    if test_dir is None or not test_dir.exists():
-        return VerificationOutcome(
-            claim=claim,
-            result=VerificationResult.FAILED,
-            evidence=f"{scope_label} directory not found",
-            checked_at=now,
-            method="count_check",
-        )
-
+def _count_tests_in_dir(test_dir: Path) -> tuple:
+    """Count test functions in a directory. Returns (count, file_count)."""
     test_files = list(test_dir.rglob("test_*.py"))
     test_count = 0
     for tf in test_files:
@@ -1007,25 +1003,87 @@ def _verify_test_count(
             test_count += len(re.findall(r'^\s*def test_', content, re.MULTILINE))
         except (OSError, UnicodeDecodeError):
             continue
+    return test_count, len(test_files)
 
+
+def _verify_test_count(
+    claim: Claim, root: Path, now: str,
+) -> VerificationOutcome:
+    """Verify test count claims by counting test functions.
+
+    Scope-aware: if the claim mentions a specific component (e.g. "confab tests",
+    "synthesis tests"), searches for a tests/ directory under that component first.
+    When no component scope matches, searches ALL test directories and passes if
+    any directory's count matches the claimed number within tolerance. This prevents
+    false positives where an unscoped claim like "297 tests" gets checked only
+    against the workspace-level tests/ directory.
+    """
     claimed = int(claim.extracted_numbers[0])
-    evidence = (
-        f"  Claimed: {claimed} tests\n"
-        f"  Actual: {test_count} test functions in {len(test_files)} files under {scope_label}\n"
-    )
-
     tolerance = max(claimed * 0.2, 3)
-    if abs(test_count - claimed) <= tolerance:
-        result = VerificationResult.PASSED
-        evidence += f"  → Approximately correct (tolerance: ±{int(tolerance)})"
-    else:
-        result = VerificationResult.FAILED
-        evidence += f"  → Count mismatch (tolerance: ±{int(tolerance)})"
 
-    return VerificationOutcome(
-        claim=claim, result=result, evidence=evidence,
-        checked_at=now, method="count_check",
-    )
+    # Try scoped match first (claim mentions a component name)
+    scoped_dir = _find_scoped_test_dir(claim.text, root)
+    if scoped_dir is not None and scoped_dir.exists():
+        scope_label = str(scoped_dir.relative_to(root))
+        test_count, file_count = _count_tests_in_dir(scoped_dir)
+        evidence = (
+            f"  Claimed: {claimed} tests\n"
+            f"  Actual: {test_count} test functions in {file_count} files under {scope_label}\n"
+        )
+        if abs(test_count - claimed) <= tolerance:
+            evidence += f"  → Approximately correct (tolerance: ±{int(tolerance)})"
+            return VerificationOutcome(
+                claim=claim, result=VerificationResult.PASSED,
+                evidence=evidence, checked_at=now, method="count_check",
+            )
+        else:
+            evidence += f"  → Count mismatch (tolerance: ±{int(tolerance)})"
+            return VerificationOutcome(
+                claim=claim, result=VerificationResult.FAILED,
+                evidence=evidence, checked_at=now, method="count_check",
+            )
+
+    # No scoped match — search ALL test directories for best match.
+    # This prevents false positives when an unscoped claim like "297 tests"
+    # gets checked against the wrong directory.
+    all_test_dirs = _find_all_test_dirs(root)
+    if not all_test_dirs:
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.FAILED,
+            evidence="No test directories found",
+            checked_at=now, method="count_check",
+        )
+
+    best_match = None
+    best_delta = float('inf')
+    results = []
+    for td in all_test_dirs:
+        label = str(td.relative_to(root))
+        count, files = _count_tests_in_dir(td)
+        delta = abs(count - claimed)
+        results.append((label, count, files, delta))
+        if delta < best_delta:
+            best_delta = delta
+            best_match = (label, count, files)
+
+    evidence = f"  Claimed: {claimed} tests (no component scope in claim)\n"
+    evidence += "  Searched:\n"
+    for label, count, files, delta in sorted(results, key=lambda x: x[3]):
+        marker = " ←" if delta <= tolerance else ""
+        evidence += f"    {label}: {count} tests in {files} files (Δ{delta}){marker}\n"
+
+    if best_delta <= tolerance:
+        evidence += f"  → Matched {best_match[0]} within tolerance (±{int(tolerance)})"
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.PASSED,
+            evidence=evidence, checked_at=now, method="count_check",
+        )
+    else:
+        evidence += f"  → No directory matched within tolerance (±{int(tolerance)})"
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.FAILED,
+            evidence=evidence, checked_at=now, method="count_check",
+        )
 
 
 def _find_scoped_test_dir(claim_text: str, root: Path) -> Optional[Path]:
@@ -1036,7 +1094,7 @@ def _find_scoped_test_dir(claim_text: str, root: Path) -> Optional[Path]:
     false positives where a claim about "154 confab tests" gets checked against
     526 tests across the entire workspace.
 
-    Returns None if no test directory is found.
+    Returns None if no scoped match is found.
     """
     claim_lower = claim_text.lower()
 
@@ -1052,11 +1110,27 @@ def _find_scoped_test_dir(claim_text: str, root: Path) -> Optional[Path]:
                 if tests_dir.is_dir():
                     return tests_dir
 
-    # No scoped match — fall back to workspace-level tests/
-    fallback = root / "tests"
-    if fallback.exists():
-        return fallback
     return None
+
+
+def _find_all_test_dirs(root: Path) -> list:
+    """Find all test directories in the workspace."""
+    dirs = []
+    # Workspace-level tests/
+    ws = root / "tests"
+    if ws.is_dir():
+        dirs.append(ws)
+    # Component-level tests/ under core/ and projects/
+    for prefix in ("core", "projects"):
+        prefix_dir = root / prefix
+        if not prefix_dir.is_dir():
+            continue
+        for child in sorted(prefix_dir.iterdir()):
+            if child.is_dir():
+                tests_dir = child / "tests"
+                if tests_dir.is_dir():
+                    dirs.append(tests_dir)
+    return dirs
 
 
 def verify_registry(paths: List[str]) -> VerificationOutcome:

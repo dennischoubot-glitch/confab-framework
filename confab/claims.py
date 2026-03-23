@@ -35,6 +35,32 @@ class ClaimType(Enum):
     SUBJECTIVE = "subjective"            # opinions, assessments
 
 
+# Behavior claim types — transient runtime state that can change without file edits.
+# Claims of these types represent point-in-time observations (API responses, process
+# status, pipeline health) that go stale quickly. Verification tags on behavior claims
+# should be subject to TTL expiry — a [v1: verified 10 hours ago] on "responder 403"
+# tells you almost nothing about right now.
+BEHAVIOR_CLAIM_TYPES = {
+    ClaimType.PIPELINE_WORKS,
+    ClaimType.PIPELINE_BLOCKED,
+    ClaimType.PROCESS_STATUS,
+    ClaimType.STATUS_CLAIM,
+    ClaimType.SCRIPT_RUNS,
+    ClaimType.SCRIPT_BROKEN,
+}
+
+# State claim types — durable system state that changes only via explicit action.
+# Files don't spontaneously appear, env vars don't reset themselves.
+# No TTL needed — the gate's static verification is sufficient.
+STATE_CLAIM_TYPES = {
+    ClaimType.FILE_EXISTS,
+    ClaimType.FILE_MISSING,
+    ClaimType.ENV_VAR,
+    ClaimType.CONFIG_PRESENT,
+    ClaimType.COUNT_CLAIM,
+}
+
+
 class VerifiabilityLevel(Enum):
     """How automatically verifiable a claim is."""
     AUTO = "auto"           # Can be verified by code right now
@@ -610,6 +636,75 @@ def extract_claims_from_file(
         return []
     text = path.read_text()
     return extract_claims(text, source_file=str(path), exclude_sections=exclude_sections)
+
+
+def is_behavior_claim(claim: Claim) -> bool:
+    """Check if a claim represents transient runtime state subject to TTL.
+
+    Behavior claims (pipeline status, process state, API responses) are
+    point-in-time observations that go stale quickly. State claims (file
+    exists, env var set) are durable and don't need TTL.
+    """
+    return claim.claim_type in BEHAVIOR_CLAIM_TYPES
+
+
+# Pattern to extract dates from verification tags: YYYY-MM-DD with optional time
+_VTAG_DATE_RE = re.compile(
+    r'(\d{4}-\d{2}-\d{2})'           # Date: 2026-03-21
+    r'(?:\s+(\d{1,2}:\d{2}\s*[AP]M))?' # Optional time: 8:22PM or 8:22 PM
+)
+
+# Pattern to extract date from [verified: YYYY-MM-DD] format
+_VTAG_VERIFIED_DATE_RE = re.compile(r'verified(?::\s*(\d{4}-\d{2}-\d{2}))')
+
+
+def parse_vtag_timestamp(vtag: str) -> Optional[datetime]:
+    """Extract a datetime from a verification tag string.
+
+    Handles formats:
+    - [v1: verified 2026-03-21 8:22PM]
+    - [v1: verified 2026-03-21]
+    - [v2: checked via pip show 2026-03-22]
+    - [verified: 2026-03-21]
+
+    Returns None if no date can be extracted (e.g. [unverified], [FAILED: ...]).
+    """
+    if not vtag:
+        return None
+
+    # Skip tags that aren't positive verification
+    vtag_lower = vtag.lower()
+    if 'unverified' in vtag_lower or 'failed' in vtag_lower:
+        return None
+
+    # Try [verified: YYYY-MM-DD] format first
+    vm = _VTAG_VERIFIED_DATE_RE.search(vtag)
+    if vm and vm.group(1):
+        try:
+            return datetime.strptime(vm.group(1), '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # Try general date pattern
+    dm = _VTAG_DATE_RE.search(vtag)
+    if dm:
+        date_str = dm.group(1)
+        time_str = dm.group(2)
+        try:
+            if time_str:
+                # Normalize: "8:22PM" -> "8:22 PM"
+                time_clean = time_str.strip().upper()
+                if time_clean[-2:] in ('AM', 'PM') and time_clean[-3] != ' ':
+                    time_clean = time_clean[:-2] + ' ' + time_clean[-2:]
+                return datetime.strptime(
+                    f"{date_str} {time_clean}", '%Y-%m-%d %I:%M %p'
+                ).replace(tzinfo=timezone.utc)
+            else:
+                return datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    return None
 
 
 def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:

@@ -73,13 +73,9 @@ _IA_PIPELINE_NAMES = {
 
 # Process/service status verification configuration.
 # Maps service keyword patterns → verification config.
+# Keyword matching normalizes dashes/spaces (verify.py), so only one variant needed.
 _IA_PROCESS_SERVICES: Dict[str, Dict[str, Any]] = {
     "weather-rewards": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:weather-rewards",
-    },
-    "weather rewards": {
         "manager": "supervisorctl",
         "config": "slack-bridge/supervisord.conf",
         "service_name": "ia-services:weather-rewards",
@@ -94,25 +90,25 @@ _IA_PROCESS_SERVICES: Dict[str, Dict[str, Any]] = {
         "config": "slack-bridge/supervisord.conf",
         "service_name": "ia-services:slack-monitor",
     },
-    "slack monitor": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:slack-monitor",
-    },
     "web-server": {
         "manager": "supervisorctl",
         "config": "slack-bridge/supervisord.conf",
         "service_name": "ia-services:web-server",
     },
-    "web server": {
+    "camping-monitor": {
         "manager": "supervisorctl",
         "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:web-server",
+        "service_name": "ia-services:camping-monitor",
     },
     "camping-server": {
         "manager": "supervisorctl",
         "config": "slack-bridge/supervisord.conf",
         "service_name": "ia-services:camping-server",
+    },
+    "lax-weather": {
+        "manager": "supervisorctl",
+        "config": "slack-bridge/supervisord.conf",
+        "service_name": "ia-services:lax-weather-collector",
     },
 }
 
@@ -161,6 +157,7 @@ class ConfabConfig:
     workspace_root: Path
     files_to_scan: List[str]
     stale_threshold: int = 3
+    behavior_ttl_hours: float = 6.0    # TTL for behavior claims (hours)
     db_path: Optional[Path] = None
     pipeline_outputs: Dict[str, List[str]] = field(default_factory=dict)
     pipeline_names: Dict[str, str] = field(default_factory=dict)
@@ -170,6 +167,9 @@ class ConfabConfig:
     exclude_sections: List[str] = field(default_factory=list)
 
     def __post_init__(self):
+        # Coerce workspace_root to Path for developer convenience
+        if isinstance(self.workspace_root, str):
+            self.workspace_root = Path(self.workspace_root)
         if self.db_path is None:
             self.db_path = self.workspace_root / "confab_tracker.db"
 
@@ -274,6 +274,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
 
     files = confab.get("files_to_scan", [])
     threshold = confab.get("stale_threshold", 3)
+    behavior_ttl = confab.get("behavior_ttl_hours", 6.0)
     db = confab.get("db_path", "confab_tracker.db")
 
     pipelines = confab.get("pipelines", {})
@@ -290,6 +291,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
         workspace_root=workspace_root,
         files_to_scan=files,
         stale_threshold=threshold,
+        behavior_ttl_hours=behavior_ttl,
         db_path=workspace_root / db,
         pipeline_outputs=pipelines,
         pipeline_names=pipeline_names,

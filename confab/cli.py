@@ -133,6 +133,14 @@ def cmd_gate(args):
         print(json.dumps(report.to_dict(), indent=2))
     else:
         print(report.format_report())
+        # Helpful hint when nothing was scanned
+        if not report.files_scanned and not args.file:
+            print("\nNo files configured to scan.")
+            config = get_config()
+            if not (config.workspace_root / "confab.toml").exists():
+                print("Run `confab init` to create a confab.toml, then configure your scan targets.")
+            else:
+                print("Edit confab.toml and uncomment or add files to `files_to_scan`.")
 
     # Exit code: 1 if failures found
     if report.has_failures:
@@ -1213,9 +1221,38 @@ known = [
 """
     target.write_text(content)
     print(f"Created {target}")
+
     if candidates:
         print(f"Auto-detected {len(candidates)} markdown file(s) — uncomment the ones to scan.")
-    print("Edit the file to configure your scan targets, then run: confab gate")
+        print("Edit confab.toml to configure your scan targets, then run: confab gate")
+    else:
+        # No markdown files found — create a sample so the user can test immediately
+        sample_dir = cwd / "docs"
+        sample_dir.mkdir(exist_ok=True)
+        sample_file = sample_dir / "priorities.md"
+        if not sample_file.exists():
+            sample_file.write_text("""\
+# Priorities
+
+## Current Sprint
+
+- Feature X depends on `src/config.py` being configured
+- Deploy blocked on DATABASE_URL not being set
+- The data pipeline output at `output/results.json` is stale [unverified]
+
+## Completed
+
+- Set up CI/CD pipeline [v2: checked tests 2026-03-20]
+""")
+            # Update confab.toml to scan the sample file
+            content = content.replace(
+                '    # "docs/priorities.md",\n    # "notes/handoff.md",',
+                '    "docs/priorities.md",',
+            )
+            target.write_text(content)
+            print(f"Created sample file: {sample_file}")
+
+        print("Try it now: confab gate")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ from .claims import (
     VerifiabilityLevel,
     extract_claims,
     extract_claims_from_file,
+    is_behavior_claim,
+    parse_vtag_timestamp,
     summarize_claims,
 )
 from .tracker import (
@@ -67,6 +69,7 @@ class GateReport:
     stale_details: List[Dict[str, Any]]
     all_outcomes: List[VerificationOutcome]
     registry_violations: List[Dict[str, Any]] = field(default_factory=list)
+    ttl_expired: List[Dict[str, Any]] = field(default_factory=list)  # Behavior claims past TTL
     # Tracker metadata (populated when tracker is enabled)
     tracker_new: int = 0           # Claims seen for the first time
     tracker_returning: int = 0     # Claims seen before
@@ -85,8 +88,13 @@ class GateReport:
         return len(self.registry_violations) > 0
 
     @property
+    def has_ttl_expired(self) -> bool:
+        return len(self.ttl_expired) > 0
+
+    @property
     def clean(self) -> bool:
-        return not self.has_failures and not self.has_stale and not self.has_registry_violations
+        return (not self.has_failures and not self.has_stale
+                and not self.has_registry_violations and not self.has_ttl_expired)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,6 +108,7 @@ class GateReport:
             "skipped": self.skipped,
             "stale_claims": self.stale_claims,
             "registry_violations": self.registry_violations,
+            "ttl_expired": self.ttl_expired,
             "clean": self.clean,
             "failed_details": self.failed_details,
             "stale_details": self.stale_details,
@@ -146,6 +155,20 @@ class GateReport:
                 lines.append(f"  Action: Verify or delete before propagating.")
                 lines.append("")
 
+        if self.has_ttl_expired:
+            lines.append(f"\n## TTL-EXPIRED BEHAVIOR CLAIMS ({len(self.ttl_expired)})")
+            lines.append("")
+            lines.append("These behavior claims have verification tags older than the TTL.")
+            lines.append("Runtime state (API responses, process status) goes stale — re-verify before propagating:")
+            lines.append("")
+            for detail in self.ttl_expired:
+                lines.append(f"**Claim:** {detail['claim_text']}")
+                if detail.get('source_file'):
+                    lines.append(f"  Source: {detail['source_file']}:{detail.get('source_line', '?')}")
+                lines.append(f"  Verified: {detail.get('verified_at', '?')} ({detail.get('age_hours', '?'):.1f}h ago)")
+                lines.append(f"  Action: Re-verify this behavior claim — it may have resolved.")
+                lines.append("")
+
         if self.has_registry_violations:
             lines.append(f"\n## REGISTRY VIOLATIONS ({len(self.registry_violations)})")
             lines.append("")
@@ -164,6 +187,7 @@ class GateReport:
         lines.append(f"- Failed: {self.failed}")
         lines.append(f"- Inconclusive: {self.inconclusive}")
         lines.append(f"- Stale: {self.stale_claims}")
+        lines.append(f"- TTL-expired: {len(self.ttl_expired)}")
         lines.append(f"- Registry violations: {len(self.registry_violations)}")
         lines.append(f"- Manual: {self.skipped}")
 
@@ -196,6 +220,8 @@ class GateReport:
 
         if self.has_failures:
             lines.append("## :x: Confab Gate — Failed")
+        elif self.has_ttl_expired:
+            lines.append("## :warning: Confab Gate — TTL-Expired Behavior Claims")
         elif self.has_stale:
             lines.append("## :warning: Confab Gate — Stale Claims")
         elif self.has_registry_violations:
@@ -210,6 +236,8 @@ class GateReport:
         lines.append(f"| Failed | {self.failed} |")
         lines.append(f"| Stale | {self.stale_claims} |")
         lines.append(f"| Inconclusive | {self.inconclusive} |")
+        if self.ttl_expired:
+            lines.append(f"| TTL-expired | {len(self.ttl_expired)} |")
         if self.registry_violations:
             lines.append(f"| Registry violations | {len(self.registry_violations)} |")
 
@@ -235,6 +263,17 @@ class GateReport:
                 lines.append(f"- [{age} runs] {detail['claim_text'][:120]}")
             if len(self.stale_details) > 10:
                 lines.append(f"- *...and {len(self.stale_details) - 10} more*")
+
+        # TTL-expired behavior claims
+        if self.has_ttl_expired:
+            lines.append("")
+            lines.append("### TTL-Expired Behavior Claims")
+            lines.append("")
+            for detail in self.ttl_expired[:10]:
+                hours = detail.get('age_hours', 0)
+                lines.append(f"- [{hours:.0f}h old] {detail['claim_text'][:120]}")
+            if len(self.ttl_expired) > 10:
+                lines.append(f"- *...and {len(self.ttl_expired) - 10} more*")
 
         # Registry violations
         if self.has_registry_violations:
@@ -270,6 +309,8 @@ class GateReport:
         status_parts = []
         if self.failed > 0:
             status_parts.append(f":x: {self.failed} FAILED")
+        if self.has_ttl_expired:
+            status_parts.append(f":clock3: {len(self.ttl_expired)} TTL-expired")
         if self.stale_claims > 0:
             status_parts.append(f":hourglass: {self.stale_claims} stale")
         if self.has_registry_violations:
@@ -300,6 +341,18 @@ class GateReport:
             remaining = len(self.stale_details) - len(shown)
             if remaining > 0:
                 lines.append(f"  ...and {remaining} more stale claims")
+
+        # TTL-expired behavior claims (compact, max 3)
+        if self.has_ttl_expired:
+            lines.append("")
+            shown = self.ttl_expired[:3]
+            for detail in shown:
+                claim_short = detail['claim_text'][:80]
+                hours = detail.get('age_hours', 0)
+                lines.append(f":clock3: [{hours:.0f}h old] {claim_short}")
+            remaining = len(self.ttl_expired) - len(shown)
+            if remaining > 0:
+                lines.append(f"  ...and {remaining} more TTL-expired claims")
 
         # Registry violations (compact)
         if self.has_registry_violations:
@@ -439,6 +492,33 @@ def run_gate(
     # Registry enforcement: scan all file references and check against SYSTEM_REGISTRY.md
     registry_violations = _check_registry(files, text, config)
 
+    # TTL expiry for behavior claims: pipeline status, process state, API responses
+    # are point-in-time observations that go stale. A [v1: verified 10h ago] on
+    # "responder 403" tells you almost nothing about right now.
+    ttl_expired_raw = _check_behavior_ttl(all_claims, config.behavior_ttl_hours)
+
+    # Cross-reference TTL-expired claims with auto-verification outcomes.
+    # If auto-verification PASSED for a TTL-expired claim, it's been freshly
+    # confirmed — suppress it from the expired list. This prevents the gate from
+    # endlessly reporting "TTL-expired" for claims that keep passing verification.
+    passed_texts = {
+        o.claim.text for o in outcomes
+        if o.result == VerificationResult.PASSED
+    }
+    ttl_expired = []
+    for detail in ttl_expired_raw:
+        claim_text = detail.get("claim_text", "")
+        # Check if any passed outcome matches this claim (prefix match since
+        # ttl detail truncates to 200 chars)
+        auto_refreshed = any(
+            pt.startswith(claim_text) or claim_text.startswith(pt[:200])
+            for pt in passed_texts
+        )
+        if auto_refreshed:
+            detail["auto_refreshed"] = True
+        else:
+            ttl_expired.append(detail)
+
     # Count results
     result_counts = {}
     for o in outcomes:
@@ -460,10 +540,58 @@ def run_gate(
         stale_details=stale_details,
         all_outcomes=outcomes,
         registry_violations=registry_violations,
+        ttl_expired=ttl_expired,
         tracker_new=tracker_new,
         tracker_returning=tracker_returning,
         tracker_total_runs=tracker_total_runs,
     )
+
+
+def _check_behavior_ttl(
+    claims: List[Claim],
+    ttl_hours: float,
+) -> List[Dict[str, Any]]:
+    """Check behavior claims for TTL expiry.
+
+    Behavior claims (pipeline status, process state, API responses) are
+    point-in-time observations. A [v1: verified 2026-03-21 8:22PM] tag
+    on "responder 403" means that was true at 8:22 PM — not necessarily now.
+
+    If the verification timestamp is older than ttl_hours, flag the claim
+    as TTL-expired so agents re-verify before propagating.
+    """
+    if ttl_hours <= 0:
+        return []
+
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta
+    ttl_delta = timedelta(hours=ttl_hours)
+
+    expired = []
+    for claim in claims:
+        if not is_behavior_claim(claim):
+            continue
+        if not claim.verification_tag:
+            continue
+
+        vtag_time = parse_vtag_timestamp(claim.verification_tag)
+        if vtag_time is None:
+            continue
+
+        age = now - vtag_time
+        if age > ttl_delta:
+            age_hours = age.total_seconds() / 3600
+            expired.append({
+                "claim_text": claim.text[:200],
+                "claim_type": claim.claim_type.value,
+                "source_file": claim.source_file,
+                "source_line": claim.source_line,
+                "verified_at": vtag_time.strftime('%Y-%m-%d %H:%M UTC'),
+                "age_hours": age_hours,
+                "ttl_hours": ttl_hours,
+            })
+
+    return expired
 
 
 def _suggest_action(outcome: VerificationOutcome) -> str:

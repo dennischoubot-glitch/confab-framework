@@ -27,12 +27,19 @@ from .config import ConfabConfig, get_config, load_config, set_config
 from .gate import run_gate, quick_check, GateReport, ConfabGate
 from .claims import extract_claims, extract_claims_from_file, Claim, ClaimType
 from .verify import verify_claim, verify_all, VerificationResult, VerificationOutcome
+from .middleware import (
+    confab_gate, get_report, verify_text,
+    ConfabVerificationError, VerificationReport,
+)
 
-__version__ = "0.4.0"
+__version__ = "0.8.0"
 
 __all__ = [
     # High-level API
     "ConfabGate",
+    # Decorator middleware
+    "confab_gate", "get_report", "verify_text",
+    "ConfabVerificationError", "VerificationReport",
     # Configuration
     "ConfabConfig", "get_config", "load_config", "set_config",
     # Gate (function-based)

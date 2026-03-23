@@ -21,12 +21,17 @@ from confab.verify import (
     verify_registry,
     verify_claim,
     verify_all,
+    verify_count,
     summarize_outcomes,
     _resolve_path,
     _check_key_in_data,
     _check_supervisorctl,
     _check_systemd,
     _check_ps,
+    _verify_test_count,
+    _find_scoped_test_dir,
+    _find_all_test_dirs,
+    _count_tests_in_dir,
 )
 
 
@@ -336,6 +341,24 @@ class TestVerifyProcessStatus(unittest.TestCase):
         self.assertEqual(outcome.result, VerificationResult.PASSED)
 
     @patch('confab.verify.subprocess.run')
+    def test_dash_space_normalization(self, mock_run):
+        """Config key 'weather-rewards' should match claim text 'weather rewards' (space)."""
+        mock_run.return_value = type('', (), {
+            'stdout': 'ia-services:weather-rewards   RUNNING   pid 12345, uptime 1:00:00',
+            'stderr': '',
+            'returncode': 0,
+        })()
+        claim = Claim(
+            text="Weather rewards monitor: RUNNING (pid 65048)",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        # Should match via normalized dash/space — not INCONCLUSIVE
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
+        self.assertIn("weather", outcome.evidence.lower())
+
+    @patch('confab.verify.subprocess.run')
     def test_claims_running_actually_stopped_fails(self, mock_run):
         """Claim says running, process is STOPPED → FAILED."""
         mock_run.return_value = type('', (), {
@@ -531,6 +554,107 @@ class TestSummarizeOutcomes(unittest.TestCase):
         self.assertEqual(summary["passed"], 1)
         self.assertEqual(summary["failed"], 1)
         self.assertEqual(len(summary["failed_claims"]), 1)
+
+
+class TestVerifyTestCount(unittest.TestCase):
+    """Test the test count verification logic.
+
+    Reproduces the false positive: an unscoped claim like "297 tests passing"
+    was checked against the workspace-level tests/ directory (547 tests) instead
+    of searching all directories to find the matching core/confab/tests/ (297).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.root = Path(self.tmpdir)
+        # Create a workspace-level tests/ with 5 test functions
+        ws_tests = self.root / "tests"
+        ws_tests.mkdir()
+        (ws_tests / "test_main.py").write_text(
+            "def test_a(): pass\n"
+            "def test_b(): pass\n"
+            "def test_c(): pass\n"
+            "def test_d(): pass\n"
+            "def test_e(): pass\n"
+        )
+        # Create a component tests/ with 10 test functions
+        comp = self.root / "core" / "mylib"
+        comp.mkdir(parents=True)
+        comp_tests = comp / "tests"
+        comp_tests.mkdir()
+        (comp_tests / "test_core.py").write_text(
+            "\n".join(f"def test_func_{i}(): pass" for i in range(10))
+        )
+        self.config = ConfabConfig(
+            workspace_root=self.root,
+            files_to_scan=[],
+        )
+        set_config(self.config)
+
+    def tearDown(self):
+        reset_config()
+
+    def _make_claim(self, text, numbers):
+        return Claim(
+            text=text,
+            source_file="test.md",
+            source_line=1,
+            claim_type=ClaimType.COUNT_CLAIM,
+            verifiability=VerifiabilityLevel.AUTO,
+            extracted_paths=[],
+            extracted_numbers=[str(n) for n in numbers],
+        )
+
+    def test_scoped_claim_matches_component(self):
+        """Claim mentioning 'mylib' should scope to core/mylib/tests/."""
+        claim = self._make_claim("mylib has 10 tests", [10])
+        result = _verify_test_count(claim, self.root, "now")
+        self.assertEqual(result.result, VerificationResult.PASSED)
+        self.assertIn("core/mylib/tests", result.evidence)
+
+    def test_scoped_claim_wrong_count_fails(self):
+        """Scoped claim with wrong count should fail."""
+        claim = self._make_claim("mylib has 50 tests", [50])
+        result = _verify_test_count(claim, self.root, "now")
+        self.assertEqual(result.result, VerificationResult.FAILED)
+
+    def test_unscoped_claim_finds_best_match(self):
+        """Unscoped '10 tests passing' should find core/mylib/tests/ (10),
+        not workspace tests/ (5). This is the false positive regression test."""
+        claim = self._make_claim("10 tests passing", [10])
+        result = _verify_test_count(claim, self.root, "now")
+        self.assertEqual(result.result, VerificationResult.PASSED)
+        self.assertIn("core/mylib/tests", result.evidence)
+
+    def test_unscoped_claim_matches_workspace(self):
+        """Unscoped '5 tests' should match workspace tests/ (5)."""
+        claim = self._make_claim("5 tests pass", [5])
+        result = _verify_test_count(claim, self.root, "now")
+        self.assertEqual(result.result, VerificationResult.PASSED)
+
+    def test_unscoped_claim_no_match_fails(self):
+        """Unscoped claim with count matching no directory should fail."""
+        claim = self._make_claim("999 tests", [999])
+        result = _verify_test_count(claim, self.root, "now")
+        self.assertEqual(result.result, VerificationResult.FAILED)
+
+    def test_find_all_test_dirs(self):
+        """Should find both workspace and component test dirs."""
+        dirs = _find_all_test_dirs(self.root)
+        labels = [str(d.relative_to(self.root)) for d in dirs]
+        self.assertIn("tests", labels)
+        self.assertIn("core/mylib/tests", labels)
+
+    def test_find_scoped_returns_none_when_unscoped(self):
+        """Unscoped claim should return None from _find_scoped_test_dir."""
+        result = _find_scoped_test_dir("297 tests passing", self.root)
+        self.assertIsNone(result)
+
+    def test_count_tests_in_dir(self):
+        """Should count test functions correctly."""
+        count, files = _count_tests_in_dir(self.root / "core" / "mylib" / "tests")
+        self.assertEqual(count, 10)
+        self.assertEqual(files, 1)
 
 
 if __name__ == "__main__":
