@@ -19,9 +19,10 @@ bits at the point where cascade propagation happens.
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from .claims import (
     Claim,
@@ -52,6 +53,83 @@ from .verify import (
 # Staleness threshold: claims unverified after this many build sections
 STALE_BUILD_THRESHOLD = 3
 
+# Journal cadence: 5 entries/day at specific PST times (Dennis directive, Mar 25)
+JOURNAL_PUBLISH_HOURS_PST = [4, 7, 12, 16, 19]
+PST = ZoneInfo("America/Los_Angeles")
+
+
+def _slots_elapsed_now() -> int:
+    """Count how many journal publish slots have elapsed based on current PST time."""
+    now_pst = datetime.now(PST)
+    return sum(1 for h in JOURNAL_PUBLISH_HOURS_PST if now_pst.hour >= h)
+
+
+def _next_slot_pst() -> Optional[int]:
+    """Return the next journal publish hour (PST), or None if all slots passed."""
+    now_pst = datetime.now(PST)
+    for h in JOURNAL_PUBLISH_HOURS_PST:
+        if now_pst.hour < h:
+            return h
+    return None
+
+
+def check_journal_cadence() -> Dict[str, Any]:
+    """Check journal cadence against time-slot-based limit.
+
+    The allowed number of journal entries increases as publish slots pass:
+    - Before 4am PST: 0 allowed
+    - 4am-6:59am: 1 allowed
+    - 7am-11:59am: 2 allowed
+    - noon-3:59pm: 3 allowed
+    - 4pm-6:59pm: 4 allowed
+    - 7pm+: 5 allowed (all slots open)
+
+    Returns:
+        Dict with slots_elapsed, entries_today, allowed, remaining, status, next_slot.
+    """
+    config = get_config()
+    posts_path = config.workspace_root / "projects" / "synthesis" / "data" / "posts.json"
+
+    entries_today = []
+    if posts_path.exists():
+        with open(posts_path) as f:
+            data = json.load(f)
+        today_str = datetime.now(PST).strftime("%Y-%m-%d")
+        entries_today = [
+            p.get("title", "?")
+            for p in data.get("posts", [])
+            if p.get("date", "").startswith(today_str)
+        ]
+
+    count = len(entries_today)
+    allowed = _slots_elapsed_now()
+    remaining = max(0, allowed - count)
+    next_slot = _next_slot_pst()
+    now_pst = datetime.now(PST)
+
+    blocked = count >= allowed
+
+    return {
+        "status": "BLOCKED" if blocked else "OK",
+        "entries_today": count,
+        "titles": entries_today,
+        "slots_elapsed": allowed,
+        "allowed": allowed,
+        "remaining": remaining,
+        "next_slot": f"{next_slot}:00 PST" if next_slot else None,
+        "current_time_pst": now_pst.strftime("%H:%M PST"),
+        "schedule": [f"{h}:00" for h in JOURNAL_PUBLISH_HOURS_PST],
+        "message": (
+            f"JOURNAL CADENCE: BLOCKED ({count}/{allowed} — "
+            f"{allowed} slot{'s' if allowed != 1 else ''} elapsed"
+            f"{f', next at {next_slot}:00 PST' if next_slot else ', all slots used'})"
+            if blocked
+            else f"JOURNAL CADENCE: OK ({count}/{allowed} — "
+            f"{remaining} remaining"
+            f"{f', next slot at {next_slot}:00 PST' if next_slot else ''})"
+        ),
+    }
+
 
 @dataclass
 class GateReport:
@@ -70,6 +148,7 @@ class GateReport:
     all_outcomes: List[VerificationOutcome]
     registry_violations: List[Dict[str, Any]] = field(default_factory=list)
     ttl_expired: List[Dict[str, Any]] = field(default_factory=list)  # Behavior claims past TTL
+    journal_cadence: Optional[Dict[str, Any]] = None  # Time-slot-based journal limit
     # Tracker metadata (populated when tracker is enabled)
     tracker_new: int = 0           # Claims seen for the first time
     tracker_returning: int = 0     # Claims seen before
@@ -82,6 +161,10 @@ class GateReport:
     @property
     def has_stale(self) -> bool:
         return self.stale_claims > 0
+
+    @property
+    def journal_blocked(self) -> bool:
+        return bool(self.journal_cadence and self.journal_cadence.get("status") == "BLOCKED")
 
     @property
     def has_registry_violations(self) -> bool:
@@ -109,6 +192,7 @@ class GateReport:
             "stale_claims": self.stale_claims,
             "registry_violations": self.registry_violations,
             "ttl_expired": self.ttl_expired,
+            "journal_cadence": self.journal_cadence,
             "clean": self.clean,
             "failed_details": self.failed_details,
             "stale_details": self.stale_details,
@@ -127,7 +211,22 @@ class GateReport:
         lines.append(f"Claims found: {self.total_claims}")
         lines.append(f"Auto-verified: {self.auto_verified}")
 
-        if self.clean:
+        # Journal cadence — always show (operational info for agents)
+        if self.journal_cadence:
+            jc = self.journal_cadence
+            status_icon = "BLOCKED" if jc["status"] == "BLOCKED" else "OK"
+            lines.append(f"\n## Journal Cadence: {status_icon}")
+            lines.append(f"- {jc['entries_today']}/{jc['allowed']} entries "
+                         f"({jc['slots_elapsed']} slot{'s' if jc['slots_elapsed'] != 1 else ''} "
+                         f"elapsed at {jc['current_time_pst']})")
+            if jc.get("remaining", 0) > 0:
+                lines.append(f"- {jc['remaining']} remaining")
+            if jc.get("next_slot"):
+                lines.append(f"- Next slot: {jc['next_slot']}")
+            if jc["status"] == "BLOCKED":
+                lines.append("- **No more journal entries until next slot opens.**")
+
+        if self.clean and not self.journal_blocked:
             lines.append("\n**GATE: CLEAN** — No failed verifications or stale claims.")
             return "\n".join(lines)
 
@@ -375,6 +474,7 @@ def run_gate(
     text: Optional[str] = None,
     stale_threshold: int = STALE_BUILD_THRESHOLD,
     track: bool = True,
+    volatility: Optional[float] = None,
 ) -> GateReport:
     """Run the cascade gate on specified files and/or text.
 
@@ -384,11 +484,24 @@ def run_gate(
         text: Additional text to scan for claims.
         stale_threshold: Number of build sections after which unverified claims are flagged.
         track: Whether to record this run in the persistent tracker DB.
+        volatility: Environmental volatility (0.0–1.0). Adjusts stale_threshold
+                    and behavior TTL. High = looser, low = tighter.
+                    If None, uses config value or no adjustment.
 
     Returns:
         GateReport with verification results.
     """
     config = get_config()
+
+    # Apply volatility adjustment to thresholds
+    vol = volatility if volatility is not None else config.volatility
+    if vol is not None:
+        from .config import adjust_thresholds
+        stale_threshold, behavior_ttl = adjust_thresholds(
+            stale_threshold, config.behavior_ttl_hours, vol
+        )
+    else:
+        behavior_ttl = config.behavior_ttl_hours
 
     if files is None:
         files = config.files_to_scan
@@ -495,7 +608,7 @@ def run_gate(
     # TTL expiry for behavior claims: pipeline status, process state, API responses
     # are point-in-time observations that go stale. A [v1: verified 10h ago] on
     # "responder 403" tells you almost nothing about right now.
-    ttl_expired_raw = _check_behavior_ttl(all_claims, config.behavior_ttl_hours)
+    ttl_expired_raw = _check_behavior_ttl(all_claims, behavior_ttl)
 
     # Cross-reference TTL-expired claims with auto-verification outcomes.
     # If auto-verification PASSED for a TTL-expired claim, it's been freshly
@@ -519,6 +632,9 @@ def run_gate(
         else:
             ttl_expired.append(detail)
 
+    # Journal cadence check (time-slot-based)
+    journal_cadence = check_journal_cadence()
+
     # Count results
     result_counts = {}
     for o in outcomes:
@@ -541,6 +657,7 @@ def run_gate(
         all_outcomes=outcomes,
         registry_violations=registry_violations,
         ttl_expired=ttl_expired,
+        journal_cadence=journal_cadence,
         tracker_new=tracker_new,
         tracker_returning=tracker_returning,
         tracker_total_runs=tracker_total_runs,
@@ -623,7 +740,7 @@ def _suggest_action(outcome: VerificationOutcome) -> str:
 
 
 # Extensions to check (registrable shared resources)
-_REGISTRY_EXTENSIONS = {'.db', '.json', '.py'}
+_REGISTRY_EXTENSIONS = {'.db', '.json', '.py', '.md'}
 
 # Paths to skip during registry checks (framework internals, non-shared files)
 _REGISTRY_SKIP_PREFIXES = (
@@ -638,7 +755,202 @@ _REGISTRY_SKIP_BASENAMES = {
     'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.node.json',
     'wrangler.json', 'wrangler.jsonc', '.eslintrc.json', 'babel.config.json',
     '__init__.py', 'conftest.py', 'setup.py', 'pyproject.toml',
+    # Standard per-project markdown (not shared resources)
+    'README.md', 'CHANGELOG.md', 'PROJECT_STATE.md', 'SKILL.md', 'CLAUDE.md',
+    'DESIGN.md', 'LICENSE.md', 'CONTRIBUTING.md', 'TODO.md',
 }
+
+
+def _is_registrable(path_str: str, basename: str, ext: str) -> bool:
+    """Return True if this file should appear in the registry."""
+    if ext not in _REGISTRY_EXTENSIONS:
+        return False
+    if any(path_str.startswith(pfx) for pfx in _REGISTRY_SKIP_PREFIXES):
+        return False
+    if basename in _REGISTRY_SKIP_BASENAMES:
+        return False
+    if basename.startswith('test_') and ext == '.py':
+        return False
+    return True
+
+
+def _in_registry(path_str: str, basename: str, registry_text: str) -> bool:
+    """Return True if the path appears in registry text."""
+    return (
+        f"`{path_str}`" in registry_text
+        or f"`{basename}`" in registry_text
+        or path_str in registry_text
+    )
+
+
+def _violation_action(ext: str) -> str:
+    """Return suggested action for an unregistered file by extension."""
+    if ext == '.db':
+        return "Register in SYSTEM_REGISTRY.md or consolidate into an existing database."
+    elif ext == '.json':
+        return "Register in SYSTEM_REGISTRY.md or use an existing JSON data file."
+    elif ext == '.md':
+        return "Register in SYSTEM_REGISTRY.md if this is shared documentation."
+    return "Register in SYSTEM_REGISTRY.md if this is a shared script."
+
+
+# Directories to walk for filesystem-based registry scan.
+# Only shared resource directories — not every file in the repo.
+_REGISTRY_SCAN_DIRS = (
+    'scripts/',
+    'projects/',
+    'data/',
+    'trading_gates/',
+)
+
+# Additional path prefixes to skip during filesystem scan
+_FILESYSTEM_SKIP_PREFIXES = (
+    'node_modules/',
+    '__pycache__/',
+    '.git/',
+    'venv/',
+    '.venv/',
+    'dist/',
+    'build/',
+    '_archived/',
+    'posts-body/',        # Generated content (one JSON per journal entry)
+    'dossiers/',          # Generated dossier output files
+)
+
+# .json basenames to skip during filesystem scan (non-shared config/state)
+_FILESYSTEM_SKIP_JSON = {
+    'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.node.json',
+    'wrangler.json', 'wrangler.jsonc', '.eslintrc.json', 'babel.config.json',
+    'launch.json', 'settings.json', 'extensions.json',
+    '.agent-lock',
+}
+
+
+def _scan_filesystem(config: "ConfabConfig", registry_text: str) -> List[Dict[str, Any]]:
+    """Walk workspace and flag shared resource files missing from the registry.
+
+    Scans for:
+    - .db files anywhere in the workspace (databases are always shared resources)
+    - .json files in project output/data dirs and top-level data/ dirs
+    - .py files in project scripts/ dirs (shared scripts, not application source)
+
+    This catches new projects that were never referenced in priority files.
+    """
+    violations: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _skip_path(rel: str) -> bool:
+        return any(f'/{skip}' in f'/{rel}' for skip in _FILESYSTEM_SKIP_PREFIXES)
+
+    def _add_violation(rel: str, ext: str) -> None:
+        violations.append({
+            'path': rel,
+            'source_file': '<filesystem>',
+            'source_line': 0,
+            'action': _violation_action(ext),
+        })
+
+    # Strategy A: ALL .db files in the workspace (databases are always registrable)
+    for path in config.workspace_root.rglob('*.db'):
+        if not path.is_file():
+            continue
+        try:
+            rel = str(path.relative_to(config.workspace_root))
+        except ValueError:
+            continue
+        if _skip_path(rel):
+            continue
+        basename = path.name
+        if basename.startswith('.'):
+            continue
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not _in_registry(rel, basename, registry_text):
+            _add_violation(rel, '.db')
+
+    # Strategy B: .json and .py in project scripts/, output/, data/ dirs
+    # These are shared resources: detection scripts, data outputs, analysis results
+    projects_dir = config.workspace_root / 'projects'
+    if projects_dir.is_dir():
+        for project in projects_dir.iterdir():
+            if not project.is_dir() or project.name.startswith(('.', '_')):
+                continue
+            for subdir_name in ('scripts', 'output', 'data'):
+                subdir = project / subdir_name
+                if not subdir.is_dir():
+                    continue
+                for path in subdir.rglob('*'):
+                    if not path.is_file():
+                        continue
+                    ext = path.suffix.lower()
+                    if ext not in ('.json', '.py'):
+                        continue
+                    try:
+                        rel = str(path.relative_to(config.workspace_root))
+                    except ValueError:
+                        continue
+                    if _skip_path(rel):
+                        continue
+                    basename = path.name
+                    if basename.startswith('.'):
+                        continue
+                    if ext == '.json' and basename in _FILESYSTEM_SKIP_JSON:
+                        continue
+                    if basename.startswith('test_') and ext == '.py':
+                        continue
+                    if rel in seen:
+                        continue
+                    seen.add(rel)
+                    if not _in_registry(rel, basename, registry_text):
+                        _add_violation(rel, ext)
+
+    # Strategy C: .json data files in top-level data/ and trading_gates/
+    for data_dir_name in ('data', 'trading_gates'):
+        data_dir = config.workspace_root / data_dir_name
+        if not data_dir.is_dir():
+            continue
+        for path in data_dir.rglob('*'):
+            if not path.is_file():
+                continue
+            ext = path.suffix.lower()
+            if ext not in ('.json', '.db'):
+                continue
+            try:
+                rel = str(path.relative_to(config.workspace_root))
+            except ValueError:
+                continue
+            basename = path.name
+            if basename.startswith('.'):
+                continue
+            if ext == '.json' and basename in _FILESYSTEM_SKIP_JSON:
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            if not _in_registry(rel, basename, registry_text):
+                _add_violation(rel, ext)
+
+    # Strategy D: .py scripts in top-level scripts/ dir
+    scripts_dir = config.workspace_root / 'scripts'
+    if scripts_dir.is_dir():
+        for path in scripts_dir.rglob('*.py'):
+            if not path.is_file():
+                continue
+            try:
+                rel = str(path.relative_to(config.workspace_root))
+            except ValueError:
+                continue
+            basename = path.name
+            if basename.startswith('.') or basename.startswith('test_'):
+                continue
+            if rel in seen:
+                continue
+            seen.add(rel)
+            if not _in_registry(rel, basename, registry_text):
+                _add_violation(rel, '.py')
+
+    return violations
 
 
 def _check_registry(
@@ -646,7 +958,10 @@ def _check_registry(
     text: Optional[str],
     config: "ConfabConfig",
 ) -> List[Dict[str, Any]]:
-    """Scan scanned files for .db/.json/.py references and check against SYSTEM_REGISTRY.md.
+    """Check files against SYSTEM_REGISTRY.md using two strategies:
+
+    1. Reference scan: parse scanned priority files for file path mentions
+    2. Filesystem scan: walk key directories for .db/.json/.py files on disk
 
     Returns a list of registry violation dicts with path, source_file, source_line, action.
     """
@@ -658,8 +973,8 @@ def _check_registry(
 
     registry_text = registry_path.read_text()
 
-    # Collect all file references from scanned files
-    file_refs: List[Dict[str, Any]] = []  # {path, source_file, source_line}
+    # --- Strategy 1: Reference-based scan (existing behavior) ---
+    file_refs: List[Dict[str, Any]] = []
 
     if files:
         for file_path in files:
@@ -695,57 +1010,35 @@ def _check_registry(
                         'source_line': line_num,
                     })
 
-    # Filter to registrable extensions and deduplicate
     seen = set()
     violations = []
 
     for ref in file_refs:
         path_str = ref['path']
         ext = Path(path_str).suffix.lower()
+        basename = Path(path_str).name
 
-        # Only check registrable file types
-        if ext not in _REGISTRY_EXTENSIONS:
+        if not _is_registrable(path_str, basename, ext):
             continue
 
-        # Skip already-seen paths
         if path_str in seen:
             continue
         seen.add(path_str)
 
-        # Skip framework internals and non-shared files
-        if any(path_str.startswith(pfx) for pfx in _REGISTRY_SKIP_PREFIXES):
-            continue
-
-        basename = Path(path_str).name
-        if basename in _REGISTRY_SKIP_BASENAMES:
-            continue
-
-        # Skip test files (test_*.py)
-        if basename.startswith('test_') and ext == '.py':
-            continue
-
-        # Check if in registry (both full path and basename)
-        in_registry = (
-            f"`{path_str}`" in registry_text
-            or f"`{basename}`" in registry_text
-            or path_str in registry_text
-        )
-
-        if not in_registry:
-            # Determine suggested action based on file type
-            if ext == '.db':
-                action = "Register in SYSTEM_REGISTRY.md or consolidate into an existing database."
-            elif ext == '.json':
-                action = "Register in SYSTEM_REGISTRY.md or use an existing JSON data file."
-            else:  # .py
-                action = "Register in SYSTEM_REGISTRY.md if this is a shared script."
-
+        if not _in_registry(path_str, basename, registry_text):
             violations.append({
                 'path': path_str,
                 'source_file': ref['source_file'],
                 'source_line': ref['source_line'],
-                'action': action,
+                'action': _violation_action(ext),
             })
+
+    # --- Strategy 2: Filesystem scan (catches unmentioned files) ---
+    fs_violations = _scan_filesystem(config, registry_text)
+    for v in fs_violations:
+        if v['path'] not in seen:
+            seen.add(v['path'])
+            violations.append(v)
 
     return violations
 
@@ -791,6 +1084,7 @@ class ConfabGate:
         *,
         config: Optional["ConfabConfig"] = None,
         workspace_root: Optional[str] = None,
+        volatility: Optional[float] = None,
     ):
         """Initialize the gate with configuration.
 
@@ -798,8 +1092,9 @@ class ConfabGate:
             config_path: Path to a confab.toml file.
             config: A pre-built ConfabConfig object (takes precedence).
             workspace_root: Override workspace root directory.
+            volatility: Environmental volatility (0.0–1.0). Overrides config value.
         """
-        from .config import ConfabConfig as _ConfabConfig, load_config, set_config
+        from .config import ConfabConfig as _ConfabConfig, load_config, set_config, parse_volatility
 
         if config is not None:
             self._config = config
@@ -810,6 +1105,11 @@ class ConfabGate:
             self._config = load_config(workspace_root=Path(workspace_root))
         else:
             self._config = load_config()
+
+        # Apply volatility override
+        vol = parse_volatility(volatility)
+        if vol is not None:
+            self._config.volatility = vol
 
         # Set as active config so internal modules use it
         set_config(self._config)
@@ -825,6 +1125,7 @@ class ConfabGate:
         text: Optional[str] = None,
         stale_threshold: Optional[int] = None,
         track: bool = True,
+        volatility: Optional[float] = None,
     ) -> GateReport:
         """Run the cascade gate.
 
@@ -833,12 +1134,14 @@ class ConfabGate:
             text: Additional inline text to scan.
             stale_threshold: Override stale threshold from config.
             track: Whether to record in persistent tracker DB.
+            volatility: Override volatility for this run (0.0–1.0).
 
         Returns:
             GateReport with verification results.
         """
         threshold = stale_threshold if stale_threshold is not None else self._config.stale_threshold
-        return run_gate(files=files, text=text, stale_threshold=threshold, track=track)
+        vol = volatility if volatility is not None else self._config.volatility
+        return run_gate(files=files, text=text, stale_threshold=threshold, track=track, volatility=vol)
 
     def quick(self, file_path: Optional[str] = None) -> str:
         """One-line gate summary for embedding in prompts."""
@@ -863,13 +1166,23 @@ def quick_check(file_path: Optional[str] = None) -> str:
     files = [file_path] if file_path else None
     report = run_gate(files=files)
 
-    if report.clean:
-        return f"Gate: CLEAN ({report.total_claims} claims, {report.passed} verified)"
+    # Journal cadence suffix
+    jc = report.journal_cadence
+    jc_suffix = ""
+    if jc:
+        jc_suffix = f" | Journal: {jc['entries_today']}/{jc['allowed']}"
+        if jc["status"] == "BLOCKED":
+            jc_suffix += " BLOCKED"
+
+    if report.clean and not report.journal_blocked:
+        return f"Gate: CLEAN ({report.total_claims} claims, {report.passed} verified){jc_suffix}"
 
     parts = []
     if report.failed > 0:
         parts.append(f"{report.failed} FAILED")
     if report.stale_claims > 0:
         parts.append(f"{report.stale_claims} STALE")
+    if report.journal_blocked:
+        parts.append("JOURNAL BLOCKED")
 
-    return f"Gate: {'|'.join(parts)} ({report.total_claims} claims, {report.passed} passed)"
+    return f"Gate: {'|'.join(parts)} ({report.total_claims} claims, {report.passed} passed){jc_suffix}"

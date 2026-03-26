@@ -17,6 +17,12 @@ files_to_scan = [
 # How many gate runs before unverified claims are flagged stale
 stale_threshold = 3
 
+# Environmental volatility: adjusts stale_threshold and behavior_ttl_hours.
+# Accepts "low", "medium", "high", or a float 0.0–1.0.
+# High volatility = looser thresholds (faster adaptation).
+# Low volatility = tighter thresholds (integrity preservation).
+# volatility = "medium"
+
 # Where to store the tracker database (relative to workspace root)
 db_path = "confab_tracker.db"
 
@@ -45,110 +51,74 @@ from typing import Any, Dict, List, Optional, Set
 
 CONFIG_FILENAME = "confab.toml"
 
-# ia-specific defaults (used when running from the ia repo with no config file)
-_IA_SCAN_FILES = [
-    "core/agents/builder/builder_priorities.md",
-    "core/agents/dreamer/dreamer_priorities.md",
-]
 
-_IA_PIPELINE_OUTPUTS = {
-    "generate_audio.py": ["projects/synthesis/audio/"],
-    "publish_substack.py": ["projects/synthesis/scripts/.substack_drafted"],
-    "notes_cron.py": ["projects/synthesis/scripts/.notes_posted"],
+# Named volatility presets → numeric values (0.0–1.0)
+VOLATILITY_PRESETS = {
+    "low": 0.2,
+    "medium": 0.5,
+    "high": 0.8,
 }
 
-# Pipeline name keywords → script names. Used by verify_status_by_name()
-# to resolve status claims like "Notes pipeline operational" that lack
-# explicit file paths.
-_IA_PIPELINE_NAMES = {
-    "audio pipeline": "generate_audio.py",
-    "audio": "generate_audio.py",
-    "substack pipeline": "publish_substack.py",
-    "notes pipeline": "notes_cron.py",
-    "notes queue": "notes_cron.py",
-    "substack responder": "substack_responder.py",
-    "weather monitor": "kalshi_weather_mm.py",
-    "weather rewards": "kalshi_weather_mm.py",
-}
 
-# Process/service status verification configuration.
-# Maps service keyword patterns → verification config.
-# Keyword matching normalizes dashes/spaces (verify.py), so only one variant needed.
-_IA_PROCESS_SERVICES: Dict[str, Dict[str, Any]] = {
-    "weather-rewards": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:weather-rewards",
-    },
-    "weather monitor": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:weather-rewards",
-    },
-    "slack-monitor": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:slack-monitor",
-    },
-    "web-server": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:web-server",
-    },
-    "camping-monitor": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:camping-monitor",
-    },
-    "camping-server": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:camping-server",
-    },
-    "lax-weather": {
-        "manager": "supervisorctl",
-        "config": "slack-bridge/supervisord.conf",
-        "service_name": "ia-services:lax-weather-collector",
-    },
-}
+def parse_volatility(value: Any) -> Optional[float]:
+    """Parse a volatility value from string or numeric input.
 
-_IA_KNOWN_ENV_VARS = {
-    'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
-    'KALSHI_API_KEY', 'KALSHI_KEY_ID', 'KALSHI_PRIVATE_KEY',
-    'SUBSTACK_COOKIE', 'SUBSTACK_TOKEN', 'SUBSTACK_SID',
-    'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_WEBHOOK',
-    'DEVTO_API_KEY', 'GITHUB_TOKEN', 'DATABASE_URL',
-    'SECRET_KEY', 'API_KEY', 'AWS_ACCESS_KEY_ID',
-    'AWS_SECRET_ACCESS_KEY', 'GOOGLE_API_KEY',
-}
+    Accepts:
+        - Named presets: "low", "medium", "high"
+        - "auto": compute from market scan regime weights (data/market_scan.json)
+        - Numeric: 0.0 to 1.0 (float or string)
+        - None: no adjustment
 
-# Sections to skip during claim extraction (regex patterns matched against headings).
-# These sections contain knowledge notes, germinating ideas, or strategic context
-# that are NOT system state claims and should not trigger stale warnings.
-_IA_EXCLUDE_SECTIONS = [
-    r"Germinating threads",
-    r"For Next Dreamer",
-    r"Active Tensions",
-    r"Settled Stances",
-    r"Previous\s+—",
-]
+    Returns:
+        Float 0.0–1.0 or None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        value_lower = value.strip().lower()
+        if value_lower == "auto":
+            from .signals import compute_volatility_from_market_scan
+            return compute_volatility_from_market_scan()
+        if value_lower in VOLATILITY_PRESETS:
+            return VOLATILITY_PRESETS[value_lower]
+        try:
+            return max(0.0, min(1.0, float(value_lower)))
+        except ValueError:
+            return None
+    return None
 
-# Count verification sources: keyword pattern -> {file, type, count_pattern}
-# Used by verify.py to check count claims against actual data.
-_IA_COUNT_SOURCES = {
-    "journal_entries": {
-        "file": "projects/synthesis/data/posts.json",
-        "type": "json_array",           # count items in a JSON array
-        "json_path": "posts",           # key to the array (top-level)
-    },
-    "notes_queue": {
-        "file": "projects/synthesis/scripts/notes_queue.md",
-        "type": "regex_count",          # count regex matches
-        "pattern": r"^###\s+Note\s+\d+",
-        "rate_per_day": 3.0,            # 3x/day cron (9am, 1pm, 5pm PST)
-        "posted_file": "projects/synthesis/scripts/.notes_posted",  # subtract posted count
-    },
-}
+
+def adjust_thresholds(
+    stale_threshold: int,
+    behavior_ttl_hours: float,
+    volatility: float,
+) -> tuple:
+    """Adjust gate thresholds based on volatility.
+
+    Volatility 0.0 (stable) → tighter: lower stale threshold, shorter TTL.
+    Volatility 0.5 (neutral) → no change.
+    Volatility 1.0 (volatile) → looser: higher stale threshold, longer TTL.
+
+    The multiplier scales linearly from 0.5× at volatility=0 to 2.0× at volatility=1.
+
+    Returns:
+        (adjusted_stale_threshold: int, adjusted_ttl_hours: float)
+    """
+    # Linear scale: 0.0→0.5x, 0.5→1.0x, 1.0→2.0x
+    # Piecewise to keep 0.5 as the identity point:
+    if volatility <= 0.5:
+        # 0.0→0.5, 0.5→1.0
+        multiplier = 0.5 + volatility
+    else:
+        # 0.5→1.0, 1.0→2.0
+        multiplier = 1.0 + 2.0 * (volatility - 0.5)
+
+    adjusted_stale = max(1, round(stale_threshold * multiplier))
+    adjusted_ttl = behavior_ttl_hours * multiplier
+
+    return adjusted_stale, adjusted_ttl
 
 
 @dataclass
@@ -158,6 +128,7 @@ class ConfabConfig:
     files_to_scan: List[str]
     stale_threshold: int = 3
     behavior_ttl_hours: float = 6.0    # TTL for behavior claims (hours)
+    volatility: Optional[float] = None  # 0.0–1.0, adjusts thresholds
     db_path: Optional[Path] = None
     pipeline_outputs: Dict[str, List[str]] = field(default_factory=dict)
     pipeline_names: Dict[str, str] = field(default_factory=dict)
@@ -172,6 +143,24 @@ class ConfabConfig:
             self.workspace_root = Path(self.workspace_root)
         if self.db_path is None:
             self.db_path = self.workspace_root / "confab_tracker.db"
+
+    @property
+    def effective_stale_threshold(self) -> int:
+        """Stale threshold adjusted for volatility."""
+        if self.volatility is None:
+            return self.stale_threshold
+        return adjust_thresholds(
+            self.stale_threshold, self.behavior_ttl_hours, self.volatility
+        )[0]
+
+    @property
+    def effective_behavior_ttl(self) -> float:
+        """Behavior TTL adjusted for volatility."""
+        if self.volatility is None:
+            return self.behavior_ttl_hours
+        return adjust_thresholds(
+            self.stale_threshold, self.behavior_ttl_hours, self.volatility
+        )[1]
 
 
 def _detect_workspace_root() -> Path:
@@ -204,6 +193,25 @@ def _is_ia_repo(root: Path) -> bool:
     return (
         (root / "core" / "confab" / "__init__.py").exists()
         and (root / "core" / "agents").is_dir()
+    )
+
+
+def _load_ia_defaults(workspace_root: Path) -> "ConfabConfig":
+    """Load ia-specific defaults. Only called when inside the ia repo."""
+    try:
+        from . import _ia_defaults as ia
+    except ImportError:
+        # _ia_defaults not available (standalone install) — empty config
+        return ConfabConfig(workspace_root=workspace_root, files_to_scan=[])
+    return ConfabConfig(
+        workspace_root=workspace_root,
+        files_to_scan=list(ia.SCAN_FILES),
+        pipeline_outputs=dict(ia.PIPELINE_OUTPUTS),
+        pipeline_names=dict(ia.PIPELINE_NAMES),
+        known_env_vars=set(ia.KNOWN_ENV_VARS),
+        count_sources=dict(ia.COUNT_SOURCES),
+        process_services=dict(ia.PROCESS_SERVICES),
+        exclude_sections=list(ia.EXCLUDE_SECTIONS),
     )
 
 
@@ -240,16 +248,7 @@ def load_config(
 
     # No config file — use defaults based on context
     if _is_ia_repo(workspace_root):
-        return ConfabConfig(
-            workspace_root=workspace_root,
-            files_to_scan=list(_IA_SCAN_FILES),
-            pipeline_outputs=dict(_IA_PIPELINE_OUTPUTS),
-            pipeline_names=dict(_IA_PIPELINE_NAMES),
-            known_env_vars=set(_IA_KNOWN_ENV_VARS),
-            count_sources=dict(_IA_COUNT_SOURCES),
-            process_services=dict(_IA_PROCESS_SERVICES),
-            exclude_sections=list(_IA_EXCLUDE_SECTIONS),
-        )
+        return _load_ia_defaults(workspace_root)
 
     # Standalone with no config — empty scan list
     return ConfabConfig(
@@ -275,6 +274,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
     files = confab.get("files_to_scan", [])
     threshold = confab.get("stale_threshold", 3)
     behavior_ttl = confab.get("behavior_ttl_hours", 6.0)
+    volatility = parse_volatility(confab.get("volatility"))
     db = confab.get("db_path", "confab_tracker.db")
 
     pipelines = confab.get("pipelines", {})
@@ -292,6 +292,7 @@ def _config_from_toml(data: dict, workspace_root: Path) -> ConfabConfig:
         files_to_scan=files,
         stale_threshold=threshold,
         behavior_ttl_hours=behavior_ttl,
+        volatility=volatility,
         db_path=workspace_root / db,
         pipeline_outputs=pipelines,
         pipeline_names=pipeline_names,

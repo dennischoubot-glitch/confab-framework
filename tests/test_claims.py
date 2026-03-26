@@ -19,6 +19,7 @@ from confab.claims import (
     OPTIONAL_FILE_RE,
     _extract_file_paths,
     _is_assertion_context,
+    _is_directive_context,
     _is_optional_reference,
     _is_config_assertion,
     _extract_config_keys,
@@ -255,6 +256,31 @@ class TestExtractClaims(unittest.TestCase):
         count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
         self.assertTrue(len(count_claims) > 0)
 
+    def test_directive_count_not_claimed(self):
+        """Directive/constraint text with numbers should not become count claims.
+
+        Regression: "1-2 entries per day maximum" was being extracted as a count
+        claim and compared against the total posts.json count (399), producing
+        false FAILED verdicts. Directives prescribe limits, not assert counts.
+        """
+        directives = [
+            "**1-2 journal entries per day maximum.** The system was producing 8-12 entries/day",
+            "**7 entries already published today (Mar 23)** (verified via git log)",
+            "**When today's 1-2 entries are already published, redirect sprint cycles to:**",
+            "Cap of 3 posts per session at most",
+        ]
+        for text in directives:
+            claims = extract_claims(text)
+            count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+            self.assertEqual(len(count_claims), 0, f"Directive text should not produce count claim: {text[:60]}")
+
+    def test_non_directive_count_still_extracted(self):
+        """Legitimate count assertions should still be extracted."""
+        text = "There are 361 entries confirmed in the journal"
+        claims = extract_claims(text)
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertTrue(len(count_claims) > 0, "Legitimate count claim should still be extracted")
+
     def test_optional_file_not_claimed(self):
         """Optional file references should not be treated as existence claims."""
         text = "Loads confab.toml if present or falls back to defaults"
@@ -449,6 +475,40 @@ class TestSectionExclusion(unittest.TestCase):
         self.assertFalse(any("River Measurement" in t for t in claim_texts))
         # System Status claims SHOULD appear
         self.assertTrue(any("pipeline" in t.lower() for t in claim_texts))
+
+    def test_developing_topics_excluded(self):
+        """Developing topic notes (theses, sources, status) should not be extracted."""
+        text = (
+            "## System Status\n"
+            "- **All services RUNNING** [v1: verified 2026-03-25 6:00AM]\n"
+            "- Notes pipeline operational. [v1: verified 2026-03-19]\n"
+            "\n"
+            "## Developing Topics\n"
+            "\n"
+            "### The Mortal Computation (seeded Mar 24)\n"
+            "- **Thesis:** The field of consciousness research is crystallizing...\n"
+            "- **Sources:** (1) COGITATE, Nature Apr 2025. (2) Milinkovic, Dec 2025.\n"
+            "- **Status:** 9 sources. DEVELOPING — needs hook, one more session.\n"
+            "\n"
+            "### The Hard Limit (seeded Mar 24)\n"
+            "- **Thesis:** Quantum computing may have a physics ceiling.\n"
+            "- **Sources:** (1) Palmer, PNAS 2026. (2) Quantum Insider Mar 19.\n"
+            "- **Status:** 8 sources, two independent predictions. DEVELOPING.\n"
+        )
+        claims = extract_claims(
+            text,
+            exclude_sections=["Developing Topics"],
+        )
+        claim_texts = [c.text for c in claims]
+        # System Status claims SHOULD appear
+        self.assertTrue(any("RUNNING" in t for t in claim_texts))
+        self.assertTrue(any("pipeline" in t.lower() for t in claim_texts))
+        # Developing topic notes should NOT appear
+        self.assertFalse(any("consciousness" in t.lower() for t in claim_texts))
+        self.assertFalse(any("COGITATE" in t for t in claim_texts))
+        self.assertFalse(any("Quantum" in t for t in claim_texts))
+        self.assertFalse(any("DEVELOPING" in t for t in claim_texts))
+        self.assertEqual(len(claims), 2)
 
 
 class TestProcessStatusDetection(unittest.TestCase):

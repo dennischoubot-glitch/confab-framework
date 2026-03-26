@@ -1,0 +1,124 @@
+# Confab Gate — GitHub Actions Workflow
+#
+# Verifies carry-forward claims in markdown files against reality on every PR.
+# Works with any project using confab-framework.
+#
+# Usage:
+#   1. Copy this file to your repo's .github/workflows/confab-gate.yml
+#   2. pip install confab-framework && confab init  (creates confab.toml)
+#   3. Edit confab.toml to list your priority/handoff files
+#   4. Push — the gate runs on every PR that touches those files
+#
+# Or reference as a reusable workflow (no copy needed):
+#   jobs:
+#     confab:
+#       uses: dennischoubot-glitch/confab-framework/.github/workflows/confab-gate.yml@main
+#       with:
+#         strict: true
+
+name: Confab Gate
+
+on:
+  # Reusable workflow — other repos call this directly
+  workflow_call:
+    inputs:
+      config:
+        description: 'Path to confab.toml (auto-detected if omitted)'
+        type: string
+        default: ''
+      strict:
+        description: 'Also fail on stale claims (not just failures)'
+        type: boolean
+        default: false
+      python-version:
+        description: 'Python version'
+        type: string
+        default: '3.12'
+
+  # Direct trigger — when this file is copied into a repo
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'notes/**'
+      - '**/*.md'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    name: Verify claims
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.12' }}
+
+      - name: Install confab-framework
+        run: pip install confab-framework
+
+      - name: Run confab gate
+        id: confab
+        run: |
+          ARGS="--no-track --output confab-report.md"
+
+          if [ -n "${{ inputs.config }}" ]; then
+            export CONFAB_CONFIG="${{ inputs.config }}"
+          fi
+
+          if [ "${{ inputs.strict }}" == "true" ]; then
+            ARGS="$ARGS --strict"
+          fi
+
+          set +e
+          confab ci $ARGS --json > confab-result.json
+          EXIT_CODE=$?
+          set -e
+
+          # Parse results for step summary
+          if [ -f confab-result.json ] && python3 -c "import json; json.load(open('confab-result.json'))" 2>/dev/null; then
+            TOTAL=$(python3 -c "import json; print(json.load(open('confab-result.json')).get('total_claims', 0))")
+            PASSED=$(python3 -c "import json; print(json.load(open('confab-result.json')).get('passed', 0))")
+            FAILED=$(python3 -c "import json; print(json.load(open('confab-result.json')).get('failed', 0))")
+            STALE=$(python3 -c "import json; print(json.load(open('confab-result.json')).get('stale_claims', 0))")
+
+            echo "total=$TOTAL" >> $GITHUB_OUTPUT
+            echo "passed=$PASSED" >> $GITHUB_OUTPUT
+            echo "failed=$FAILED" >> $GITHUB_OUTPUT
+            echo "stale=$STALE" >> $GITHUB_OUTPUT
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "status=clean" >> $GITHUB_OUTPUT
+            elif [ $EXIT_CODE -eq 2 ]; then
+              echo "status=stale" >> $GITHUB_OUTPUT
+            else
+              echo "status=failed" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "total=0" >> $GITHUB_OUTPUT
+            echo "passed=0" >> $GITHUB_OUTPUT
+            echo "failed=0" >> $GITHUB_OUTPUT
+            echo "stale=0" >> $GITHUB_OUTPUT
+            echo "status=error" >> $GITHUB_OUTPUT
+          fi
+
+          exit $EXIT_CODE
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: confab-report.md
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -f confab-report.md ]; then
+            cat confab-report.md >> $GITHUB_STEP_SUMMARY
+          fi

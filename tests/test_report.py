@@ -41,11 +41,12 @@ class TestFormatHealthDashboard(unittest.TestCase):
             total_supports_checked=120,
             zombies=[],
             weakened=[],
+            degraded=[],
             healthy=50,
             no_supports=5,
             invalidated_count=20,
-            by_type={"idea": {"checked": 40, "zombie": 0, "weakened": 0, "healthy": 40}},
-            by_domain={"technology": {"checked": 30, "zombie": 0, "weakened": 0}},
+            by_type={"idea": {"checked": 40, "zombie": 0, "weakened": 0, "degraded": 0, "healthy": 40}},
+            by_domain={"technology": {"checked": 30, "zombie": 0, "weakened": 0, "degraded": 0}},
         )
         defaults.update(kwargs)
         return SupportsReport(**defaults)
@@ -162,6 +163,7 @@ class TestFormatHealthSlack(unittest.TestCase):
             total_supports_checked=120,
             zombies=[],
             weakened=[],
+            degraded=[],
             healthy=50,
             no_supports=5,
             invalidated_count=10,

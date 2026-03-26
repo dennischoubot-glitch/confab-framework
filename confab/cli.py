@@ -58,6 +58,31 @@ Usage:
     confab tree --slack
     confab tree --stale-days 7
 
+    # Auto-fix stale and failed claims
+    confab fix
+    confab fix --dry-run   # preview without modifying
+    confab fix --file path/to/priorities.md
+
+    # Fix perishable observations (add expires dates to entries with dates/prices/%)
+    confab fix --perishable              # preview table (dry-run by default)
+    confab fix --perishable --apply      # write changes to KNOWLEDGE_TREE.json
+    confab fix --perishable --json       # JSON output
+
+    # Auto-quarantine claims persisting 5+ gate runs
+    confab quarantine                    # quarantine + Slack notification
+    confab quarantine --dry-run          # preview without modifying files
+    confab quarantine --threshold 10     # custom threshold
+    confab gate --quarantine             # run gate with quarantine in one step
+
+    # Triage — unified severity-ranked remediation view
+    confab triage                        # rank all issues, suggest fixes
+    confab triage --source gate          # gate issues only
+    confab triage --source tree          # tree issues only
+    confab triage --category tree_no_ttl # filter to one category
+    confab triage --limit 5              # show top 5 only
+    confab triage --slack                # concise Slack output
+    confab triage --json                 # machine-readable output
+
     # Comprehensive audit report (tracker DB summary)
     confab audit
     confab audit --json
@@ -83,36 +108,44 @@ from pathlib import Path
 # Dual import: works both as pip-installed package and as direct script invocation.
 try:
     from .claims import extract_claims, extract_claims_from_file, summarize_claims, BUILD_HEADER_RE, FILE_PATH_RE
-    from .config import get_config, load_config, set_config
+    from .config import get_config, load_config, set_config, parse_volatility
     from .gate import run_gate, quick_check
     from .tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
         get_cascade_stats, trace_claim, get_audit_data,
+        record_fix_action, get_fix_history, update_claim_status,
+        _hash_claim,
     )
     from .verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
     from .lint import run_lint
 except ImportError:
-    # Running as script directly (python core/confab/cli.py)
+    # Running as script directly (python core/confab/cli.py) — add parent dirs to path
     _script_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(_script_dir.parent.parent))
-    from core.confab.claims import extract_claims, extract_claims_from_file, summarize_claims, BUILD_HEADER_RE, FILE_PATH_RE
-    from core.confab.config import get_config, load_config, set_config
-    from core.confab.gate import run_gate, quick_check
-    from core.confab.tracker import (
+    # Prefer the local source over any installed package
+    _parent = str(_script_dir.parent)
+    if _parent in sys.path:
+        sys.path.remove(_parent)
+    sys.path.insert(0, _parent)
+    from confab.claims import extract_claims, extract_claims_from_file, summarize_claims, BUILD_HEADER_RE, FILE_PATH_RE
+    from confab.config import get_config, load_config, set_config, parse_volatility
+    from confab.gate import run_gate, quick_check
+    from confab.tracker import (
         get_all_tracked, get_stale_claims, get_run_history,
         get_stats, remove_stale, remove_claims,
         get_cascade_stats, trace_claim, get_audit_data,
+        record_fix_action, get_fix_history, update_claim_status,
+        _hash_claim,
     )
-    from core.confab.verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
-    from core.confab.lint import run_lint
+    from confab.verify import verify_claim, verify_all, verify_file_exists, summarize_outcomes
+    from confab.lint import run_lint
 
 # Lazy import for supports (avoids loading tree JSON at module import time)
 def _get_check_supports():
     try:
         from .supports import check_supports
     except ImportError:
-        from core.confab.supports import check_supports
+        from confab.supports import check_supports
     return check_supports
 
 
@@ -120,18 +153,19 @@ def _get_check_tree():
     try:
         from .tree import check_tree
     except ImportError:
-        from core.confab.tree import check_tree
+        from confab.tree import check_tree
     return check_tree
 
 
 def cmd_gate(args):
     """Run the cascade gate."""
     files = [args.file] if args.file else None
-    report = run_gate(files=files)
+    vol = parse_volatility(getattr(args, 'volatility', None))
+    report = run_gate(files=files, volatility=vol)
 
-    if args.json:
+    if args.json and not getattr(args, 'quarantine', False):
         print(json.dumps(report.to_dict(), indent=2))
-    else:
+    elif not getattr(args, 'quarantine', False):
         print(report.format_report())
         # Helpful hint when nothing was scanned
         if not report.files_scanned and not args.file:
@@ -141,6 +175,31 @@ def cmd_gate(args):
                 print("Run `confab init` to create a confab.toml, then configure your scan targets.")
             else:
                 print("Edit confab.toml and uncomment or add files to `files_to_scan`.")
+
+    # Run quarantine if requested
+    if getattr(args, 'quarantine', False):
+        try:
+            from .quarantine import run_quarantine
+        except ImportError:
+            from confab.quarantine import run_quarantine
+        threshold = getattr(args, 'quarantine_threshold', 5)
+        dry_run = getattr(args, 'dry_run', False)
+        q_result = run_quarantine(
+            report,
+            threshold=threshold,
+            post_slack=not dry_run,
+            dry_run=dry_run,
+        )
+        if args.json:
+            output = report.to_dict()
+            output["quarantine"] = q_result.to_dict()
+            print(json.dumps(output, indent=2))
+        else:
+            print(report.format_report())
+            if q_result.quarantined:
+                print("\n" + q_result.format_report())
+            elif q_result.candidates == 0:
+                print(f"\nNo claims meet quarantine threshold ({threshold} runs).")
 
     # Exit code: 1 if failures found
     if report.has_failures:
@@ -429,6 +488,7 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
         lines.append(f"  Entries checked: {supports_report.checked_entries}  |  "
                      f"Zombies: {len(supports_report.zombies)}  |  "
                      f"Weakened: {len(supports_report.weakened)}  |  "
+                     f"Degraded: {len(supports_report.degraded)}  |  "
                      f"Healthy: {supports_report.healthy}")
         lines.append(f"  No supports: {supports_report.no_supports}  |  "
                      f"Invalidated: {supports_report.invalidated_count}  |  "
@@ -443,6 +503,9 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
             lines.append(f"  Weakened IDs: "
                          + ", ".join(w.entry_id for w in supports_report.weakened[:5])
                          + (f" ...+{len(supports_report.weakened) - 5}" if len(supports_report.weakened) > 5 else ""))
+
+        if supports_report.degraded:
+            lines.append(f"  Degraded: {len(supports_report.degraded)} entries with some dead supports (run check-supports for details)")
 
     # --- Tree factual health section ---
     lines.append("")
@@ -694,6 +757,24 @@ Examples:
     gate_parser = subparsers.add_parser("gate", help="Run the cascade gate")
     gate_parser.add_argument("--file", "-f", help="Specific file to scan")
     gate_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    gate_parser.add_argument(
+        "--volatility", "-V",
+        help="Environmental volatility: low/medium/high or 0.0-1.0. "
+             "High = looser thresholds (faster adaptation), low = tighter (integrity).",
+    )
+    gate_parser.add_argument(
+        "--quarantine", action="store_true",
+        help="Auto-quarantine claims persisting 5+ gate runs: move to QUARANTINED "
+             "section in source files and post Slack notification.",
+    )
+    gate_parser.add_argument(
+        "--quarantine-threshold", type=int, default=5,
+        help="Run count threshold for quarantine (default: 5).",
+    )
+    gate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --quarantine: preview quarantine actions without modifying files.",
+    )
 
     # check
     check_parser = subparsers.add_parser("check", help="Check inline text")
@@ -775,6 +856,48 @@ Examples:
     ci_parser.add_argument("--stale-threshold", type=int, help="Staleness threshold (default: 3 runs)")
     ci_parser.add_argument("--strict", action="store_true", help="Exit 2 on stale claims (default: only exit 1 on failures)")
     ci_parser.add_argument("--no-track", action="store_true", help="Don't record this run in the tracker DB")
+    ci_parser.add_argument(
+        "--volatility", "-V",
+        help="Environmental volatility: low/medium/high or 0.0-1.0.",
+    )
+
+    # fix — automated stale/failed claim remediation
+    fix_parser = subparsers.add_parser("fix", help="Auto-fix stale and failed claims (re-verify, update tags, delete dead lines)")
+    fix_parser.add_argument("--file", "-f", help="Specific file to scan and fix")
+    fix_parser.add_argument("--dry-run", action="store_true", help="Preview fixes without modifying files or DB")
+    fix_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    fix_parser.add_argument("--perishable", action="store_true",
+                            help="Fix perishable observations: add expires dates to tree entries with dates/prices/%% but no TTL")
+    fix_parser.add_argument("--apply", action="store_true",
+                            help="With --perishable: actually write changes (default is dry-run preview)")
+    fix_parser.add_argument("--tree", "-t", help="Path to KNOWLEDGE_TREE.json (for --perishable)")
+
+    # quarantine — standalone quarantine subcommand
+    quarantine_parser = subparsers.add_parser(
+        "quarantine",
+        help="Auto-quarantine claims persisting 5+ gate runs without verification",
+    )
+    quarantine_parser.add_argument("--file", "-f", help="Specific file to scan")
+    quarantine_parser.add_argument("--threshold", "-t", type=int, default=5,
+                                   help="Run count threshold for quarantine (default: 5)")
+    quarantine_parser.add_argument("--dry-run", action="store_true",
+                                   help="Preview without modifying files or posting to Slack")
+    quarantine_parser.add_argument("--no-slack", action="store_true",
+                                   help="Skip Slack notification")
+    quarantine_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+
+    # triage — unified severity-ranked remediation view
+    triage_parser = subparsers.add_parser(
+        "triage",
+        help="Rank all confab issues by severity, suggest fixes, enable batch operations",
+    )
+    triage_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    triage_parser.add_argument("--slack", action="store_true", help="Concise Slack-friendly output")
+    triage_parser.add_argument("--limit", "-n", type=int, default=20,
+                               help="Max items to show (default: 20)")
+    triage_parser.add_argument("--source", "-s", choices=["gate", "tree", "supports", "all"],
+                               default="all", help="Which data source to triage (default: all)")
+    triage_parser.add_argument("--category", help="Filter to specific category (e.g. tree_no_ttl, gate_stale)")
 
     # init — generate a starter confab.toml
     init_parser = subparsers.add_parser("init", help="Generate a starter confab.toml in the current directory")
@@ -814,10 +937,98 @@ Examples:
         cmd_audit(args)
     elif args.command == "ci":
         cmd_ci(args)
+    elif args.command == "fix":
+        if getattr(args, 'perishable', False):
+            cmd_fix_perishable(args)
+        else:
+            cmd_fix(args)
+    elif args.command == "quarantine":
+        cmd_quarantine(args)
+    elif args.command == "triage":
+        cmd_triage(args)
     elif args.command == "init":
         cmd_init(args)
     else:
         parser.print_help()
+
+
+def cmd_quarantine(args):
+    """Standalone quarantine: run gate then quarantine persistent stale claims."""
+    try:
+        from .quarantine import run_quarantine
+    except ImportError:
+        from confab.quarantine import run_quarantine
+
+    files = [args.file] if args.file else None
+    report = run_gate(files=files)
+
+    q_result = run_quarantine(
+        report,
+        threshold=args.threshold,
+        post_slack=not args.dry_run and not args.no_slack,
+        dry_run=args.dry_run,
+    )
+
+    if args.json:
+        output = report.to_dict()
+        output["quarantine"] = q_result.to_dict()
+        print(json.dumps(output, indent=2))
+    else:
+        if q_result.quarantined:
+            print(q_result.format_report())
+        else:
+            print(f"No claims meet quarantine threshold ({args.threshold} runs).")
+            if report.has_stale:
+                print(f"\n{report.stale_claims} stale claim(s) exist but below threshold.")
+                for d in report.stale_details[:5]:
+                    rc = d.get("tracker_run_count", d.get("age_builds", "?"))
+                    print(f"  [{rc} runs] {d['claim_text'][:80]}")
+
+
+def cmd_triage(args):
+    """Unified triage: rank all confab issues by severity, suggest fixes, batch."""
+    try:
+        from .triage import run_triage
+    except ImportError:
+        from confab.triage import run_triage
+
+    gate_report = None
+    tree_report = None
+    supports_report = None
+    source = getattr(args, 'source', 'all')
+
+    # Run requested data sources
+    if source in ("all", "gate"):
+        gate_report = run_gate()
+
+    if source in ("all", "tree"):
+        check_tree = _get_check_tree()
+        tree_report = check_tree()
+
+    if source in ("all", "supports"):
+        check_supports = _get_check_supports()
+        supports_report = check_supports()
+
+    limit = getattr(args, 'limit', 20)
+    report = run_triage(
+        gate_report=gate_report,
+        tree_report=tree_report,
+        supports_report=supports_report,
+        limit=limit,
+    )
+
+    # Filter by category if specified
+    category_filter = getattr(args, 'category', None)
+    if category_filter:
+        report.items = [i for i in report.items if i.category == category_filter]
+        report.batches = [b for b in report.batches if b.category == category_filter]
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    elif getattr(args, 'slack', False):
+        print(report.format_slack())
+    else:
+        print(report.format_report(limit=limit))
 
 
 def cmd_ci(args):
@@ -830,7 +1041,8 @@ def cmd_ci(args):
     """
     files = [args.file] if args.file else None
     stale_threshold = args.stale_threshold or 3
-    report = run_gate(files=files, stale_threshold=stale_threshold, track=not args.no_track)
+    vol = parse_volatility(getattr(args, 'volatility', None))
+    report = run_gate(files=files, stale_threshold=stale_threshold, track=not args.no_track, volatility=vol)
 
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
@@ -846,6 +1058,527 @@ def cmd_ci(args):
         sys.exit(1)
     elif report.has_stale and args.strict:
         sys.exit(2)
+
+
+def cmd_fix(args):
+    """Fix stale and failed claims automatically.
+
+    For stale claims: re-runs verification, then either updates the verification
+    tag to [v1: verified] or deletes the claim line from the source file.
+
+    For file_exists failures: uses git log --diff-filter=R to find renames and
+    updates the path in-place.
+
+    All actions are logged to the fix_actions audit table in confab_tracker.db.
+    """
+    import re
+    import subprocess
+    from datetime import datetime, timezone
+
+    dry_run = args.dry_run
+    files = [args.file] if args.file else None
+
+    # Run the gate to get current state
+    report = run_gate(files=files, track=True)
+
+    actions_taken = []
+
+    # --- Fix stale claims ---
+    for stale in report.stale_details:
+        claim_text = stale["claim_text"]
+        source_file = stale.get("source_file")
+        claim_type = stale.get("claim_type", "unknown")
+
+        # Find the matching outcome to get the Claim object for re-verification
+        matching_outcome = None
+        for outcome in report.all_outcomes:
+            if outcome.claim.text == claim_text:
+                matching_outcome = outcome
+                break
+
+        if matching_outcome is None:
+            # No matching claim in outcomes — can't re-verify, just note it
+            action = {
+                "claim": claim_text[:80],
+                "action": "skipped",
+                "detail": "No matching claim found in gate outcomes for re-verification",
+                "file": source_file,
+            }
+            actions_taken.append(action)
+            continue
+
+        # Re-verify the claim
+        reverify = verify_claim(matching_outcome.claim)
+
+        if reverify.result.value == "passed":
+            # Claim is actually valid — update the verification tag in the source file
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            new_tag = f"[v1: {reverify.method} {today}]"
+
+            if source_file and Path(source_file).exists():
+                content = Path(source_file).read_text()
+                # Find the line containing this claim text and add/update the verification tag
+                old_line = _find_claim_line(content, claim_text)
+                if old_line:
+                    updated_line = _update_verification_tag(old_line, new_tag)
+                    if updated_line != old_line:
+                        if not dry_run:
+                            content = content.replace(old_line, updated_line, 1)
+                            Path(source_file).write_text(content)
+                            claim_hash = _hash_claim(claim_text)
+                            update_claim_status(claim_hash, "verified",
+                                                evidence=reverify.evidence,
+                                                method=reverify.method)
+                            record_fix_action(
+                                claim_text=claim_text,
+                                action="verified_and_tagged",
+                                file_modified=source_file,
+                                detail=f"Re-verified PASSED ({reverify.method}). Added {new_tag}",
+                                claim_hash=claim_hash,
+                            )
+                        action = {
+                            "claim": claim_text[:80],
+                            "action": "verified_and_tagged",
+                            "detail": f"PASSED — added {new_tag}",
+                            "file": source_file,
+                        }
+                        actions_taken.append(action)
+                        continue
+
+            # Passed but couldn't update file — just update tracker
+            if not dry_run:
+                claim_hash = _hash_claim(claim_text)
+                update_claim_status(claim_hash, "verified",
+                                    evidence=reverify.evidence,
+                                    method=reverify.method)
+                record_fix_action(
+                    claim_text=claim_text,
+                    action="verified_tracker_only",
+                    file_modified=source_file,
+                    detail=f"Re-verified PASSED ({reverify.method}). Source file not updated.",
+                    claim_hash=claim_hash,
+                )
+            action = {
+                "claim": claim_text[:80],
+                "action": "verified_tracker_only",
+                "detail": f"PASSED — tracker updated (couldn't modify source)",
+                "file": source_file,
+            }
+            actions_taken.append(action)
+
+        elif reverify.result.value == "failed":
+            # Claim contradicts reality — delete the line from the source file
+            if source_file and Path(source_file).exists():
+                content = Path(source_file).read_text()
+                old_line = _find_claim_line(content, claim_text)
+                if old_line:
+                    if not dry_run:
+                        content = content.replace(old_line + "\n", "", 1)
+                        Path(source_file).write_text(content)
+                        claim_hash = _hash_claim(claim_text)
+                        update_claim_status(claim_hash, "failed",
+                                            evidence=reverify.evidence,
+                                            method=reverify.method)
+                        record_fix_action(
+                            claim_text=claim_text,
+                            action="deleted_failed_claim",
+                            file_modified=source_file,
+                            detail=f"Re-verified FAILED ({reverify.evidence}). Line removed.",
+                            claim_hash=claim_hash,
+                        )
+                    action = {
+                        "claim": claim_text[:80],
+                        "action": "deleted_failed_claim",
+                        "detail": f"FAILED — line removed ({reverify.evidence[:60]})",
+                        "file": source_file,
+                    }
+                    actions_taken.append(action)
+                    continue
+
+            # Failed but couldn't modify source
+            if not dry_run:
+                claim_hash = _hash_claim(claim_text)
+                update_claim_status(claim_hash, "failed",
+                                    evidence=reverify.evidence,
+                                    method=reverify.method)
+                record_fix_action(
+                    claim_text=claim_text,
+                    action="marked_failed",
+                    file_modified=source_file,
+                    detail=f"Re-verified FAILED. Source not modified.",
+                    claim_hash=claim_hash,
+                )
+            action = {
+                "claim": claim_text[:80],
+                "action": "marked_failed",
+                "detail": "FAILED — tracker updated (couldn't modify source)",
+                "file": source_file,
+            }
+            actions_taken.append(action)
+
+        else:
+            # Inconclusive or skipped — delete stale claims that can't be verified
+            if source_file and Path(source_file).exists():
+                content = Path(source_file).read_text()
+                old_line = _find_claim_line(content, claim_text)
+                if old_line:
+                    if not dry_run:
+                        content = content.replace(old_line + "\n", "", 1)
+                        Path(source_file).write_text(content)
+                        claim_hash = _hash_claim(claim_text)
+                        remove_claims([claim_hash])
+                        record_fix_action(
+                            claim_text=claim_text,
+                            action="deleted_unverifiable",
+                            file_modified=source_file,
+                            detail=f"Cannot auto-verify ({reverify.result.value}). "
+                                   f"Stale for {stale.get('tracker_run_count', '?')} runs. Line removed.",
+                            claim_hash=claim_hash,
+                        )
+                    action = {
+                        "claim": claim_text[:80],
+                        "action": "deleted_unverifiable",
+                        "detail": f"Unverifiable + stale ({stale.get('tracker_run_count', '?')} runs) — removed",
+                        "file": source_file,
+                    }
+                    actions_taken.append(action)
+                    continue
+
+            action = {
+                "claim": claim_text[:80],
+                "action": "skipped",
+                "detail": f"Cannot verify ({reverify.result.value}), no source to modify",
+                "file": source_file,
+            }
+            actions_taken.append(action)
+
+    # --- Fix failed FILE_EXISTS claims via git rename detection ---
+    for failed in report.failed_details:
+        claim_text = failed["claim_text"]
+        source_file = failed.get("source_file")
+        claim_type = failed.get("claim_type", "unknown")
+
+        if claim_type != "file_exists":
+            continue
+
+        # Find the Claim object to get extracted_paths
+        matching_outcome = None
+        for outcome in report.all_outcomes:
+            if outcome.claim.text == claim_text and outcome.result.value == "failed":
+                matching_outcome = outcome
+                break
+
+        if not matching_outcome or not matching_outcome.claim.extracted_paths:
+            continue
+
+        # Try git rename detection for each missing path
+        for missing_path in matching_outcome.claim.extracted_paths:
+            if Path(missing_path).exists():
+                continue  # Not actually missing
+
+            new_path = _find_git_rename(missing_path)
+            if new_path and source_file and Path(source_file).exists():
+                content = Path(source_file).read_text()
+                if missing_path in content:
+                    if not dry_run:
+                        content = content.replace(missing_path, new_path)
+                        Path(source_file).write_text(content)
+                        claim_hash = _hash_claim(claim_text)
+                        record_fix_action(
+                            claim_text=claim_text,
+                            action="updated_renamed_path",
+                            file_modified=source_file,
+                            detail=f"Git rename detected: {missing_path} → {new_path}",
+                            claim_hash=claim_hash,
+                        )
+                    action = {
+                        "claim": claim_text[:80],
+                        "action": "updated_renamed_path",
+                        "detail": f"{missing_path} → {new_path}",
+                        "file": source_file,
+                    }
+                    actions_taken.append(action)
+
+    # --- Output ---
+    if not actions_taken:
+        print("No fixable claims found. Gate is clean." if report.clean
+              else "No auto-fixable claims found. Manual review needed for remaining issues.")
+        return
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    print(f"{prefix}# Confab Fix Report\n")
+    print(f"Actions: {len(actions_taken)}\n")
+
+    for i, act in enumerate(actions_taken, 1):
+        icon = {"verified_and_tagged": "+", "deleted_failed_claim": "-",
+                "deleted_unverifiable": "-", "updated_renamed_path": "~",
+                "verified_tracker_only": "+", "marked_failed": "!",
+                "skipped": "?"}.get(act["action"], " ")
+        print(f"  [{icon}] {act['claim']}")
+        print(f"      Action: {act['action']}")
+        print(f"      Detail: {act['detail']}")
+        if act.get("file"):
+            print(f"      File: {act['file']}")
+        print()
+
+    if dry_run:
+        print("(Dry run — no files or database were modified)")
+
+    if args.json:
+        print(json.dumps(actions_taken, indent=2))
+
+
+def _propose_expires(content: str, created: Optional[str], matched_patterns: List[str]) -> tuple:
+    """Propose an expires date for a perishable observation.
+
+    Rules:
+        1. If content contains ISO dates (YYYY-MM-DD), use the latest date + 1 day.
+        2. If content contains month-day dates (Feb 26, Mar 15 2026), parse and use latest + 1 day.
+        3. If content has prices ($) or percentages (%), use created + 30 days.
+        4. If content has financial terms only, use created + 60 days.
+        5. Fallback: created + 60 days.
+
+    Returns:
+        (proposed_date: str, rule: str) — YYYY-MM-DD date and which rule matched.
+    """
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    # Try to extract explicit dates from content
+    iso_dates = re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', content)
+    month_dates = re.findall(
+        r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*)\s+(\d{1,2})(?:,?\s*(\d{4}))?',
+        content
+    )
+
+    latest_date = None
+
+    # Parse ISO dates
+    for d in iso_dates:
+        try:
+            parsed = datetime.strptime(d, "%Y-%m-%d")
+            if latest_date is None or parsed > latest_date:
+                latest_date = parsed
+        except ValueError:
+            continue
+
+    # Parse month-day dates
+    current_year = datetime.now(timezone.utc).year
+    for month_str, day_str, year_str in month_dates:
+        year = int(year_str) if year_str else current_year
+        try:
+            parsed = datetime.strptime(f"{month_str[:3]} {day_str} {year}", "%b %d %Y")
+            if latest_date is None or parsed > latest_date:
+                latest_date = parsed
+        except ValueError:
+            continue
+
+    if latest_date is not None:
+        expires = (latest_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        return expires, "event_date+1d"
+
+    # No explicit dates — use created date + offset based on pattern type
+    base_date = None
+    if created and len(created) >= 10:
+        try:
+            base_date = datetime.strptime(created[:10], "%Y-%m-%d")
+        except ValueError:
+            pass
+    if base_date is None:
+        base_date = datetime.now(timezone.utc)
+
+    if "price" in matched_patterns or "percentage" in matched_patterns:
+        expires = (base_date + timedelta(days=30)).strftime("%Y-%m-%d")
+        return expires, "price_or_pct+30d"
+
+    if "financial-term" in matched_patterns:
+        expires = (base_date + timedelta(days=60)).strftime("%Y-%m-%d")
+        return expires, "financial_term+60d"
+
+    # Fallback
+    expires = (base_date + timedelta(days=60)).strftime("%Y-%m-%d")
+    return expires, "fallback+60d"
+
+
+def cmd_fix_perishable(args):
+    """Fix perishable observations: add expires dates to tree entries with dates/prices/% but no TTL.
+
+    Default behavior: prints a preview table (dry-run).
+    With --apply: writes changes to KNOWLEDGE_TREE.json.
+    """
+    try:
+        from .tree import check_tree
+    except ImportError:
+        from confab.tree import check_tree
+
+    tree_path = getattr(args, 'tree', None)
+    apply = getattr(args, 'apply', False)
+    json_output = getattr(args, 'json', False)
+
+    # Scan tree for perishable observations without TTL
+    report = check_tree(tree_path=tree_path)
+
+    if not report.perishable_no_ttl:
+        print("No perishable observations without TTL found. Tree is clean.")
+        return
+
+    # Resolve the actual tree file path for writing
+    if tree_path:
+        tree_file = Path(tree_path)
+        if not tree_file.is_absolute():
+            tree_file = Path.cwd() / tree_path
+    else:
+        from confab.tree import DEFAULT_TREE_PATH
+        tree_file = Path.cwd() / DEFAULT_TREE_PATH
+
+    # Load tree data for reading created dates and (if applying) writing
+    tree_data = json.loads(tree_file.read_text())
+    nodes = tree_data.get("nodes", {})
+
+    # Build proposals
+    proposals = []
+    for issue in report.perishable_no_ttl:
+        node = nodes.get(issue.entry_id, {})
+        created = node.get("created", node.get("timestamp", ""))
+        full_content = node.get("content", issue.content)
+
+        proposed_date, rule = _propose_expires(
+            full_content, created, issue.matched_patterns
+        )
+        proposals.append({
+            "id": issue.entry_id,
+            "content": issue.content[:100],
+            "domain": issue.domain or "unset",
+            "patterns": issue.matched_patterns,
+            "proposed_expires": proposed_date,
+            "rule": rule,
+        })
+
+    # Output
+    if json_output:
+        result = {
+            "total_perishable_no_ttl": len(proposals),
+            "mode": "apply" if apply else "dry-run",
+            "tree_path": str(tree_file),
+            "proposals": proposals,
+        }
+        print(json.dumps(result, indent=2))
+        return
+
+    # Table output
+    mode_label = "APPLYING" if apply else "DRY RUN (use --apply to write)"
+    print(f"# Perishable Fix — {mode_label}\n")
+    print(f"Tree: {tree_file}")
+    print(f"Entries to fix: {len(proposals)}\n")
+
+    # Group by rule for summary
+    rule_counts = {}
+    for p in proposals:
+        rule_counts[p["rule"]] = rule_counts.get(p["rule"], 0) + 1
+
+    print("Rules applied:")
+    for rule, count in sorted(rule_counts.items(), key=lambda x: -x[1]):
+        print(f"  {rule}: {count}")
+    print()
+
+    # Show preview table (first 30 entries, then summary)
+    shown = proposals[:30]
+    print(f"{'ID':<10} {'Expires':<12} {'Rule':<22} {'Content'}")
+    print(f"{'─'*10} {'─'*12} {'─'*22} {'─'*50}")
+    for p in shown:
+        content_snippet = p["content"][:50].replace("\n", " ")
+        print(f"{p['id']:<10} {p['proposed_expires']:<12} {p['rule']:<22} {content_snippet}")
+    if len(proposals) > 30:
+        print(f"\n  ...and {len(proposals) - 30} more")
+
+    # Apply changes
+    if apply:
+        modified = 0
+        for p in proposals:
+            nid = p["id"]
+            if nid in nodes:
+                nodes[nid]["expires"] = p["proposed_expires"]
+                modified += 1
+
+        tree_file.write_text(json.dumps(tree_data, indent=2, ensure_ascii=False) + "\n")
+        print(f"\nWrote {modified} expires dates to {tree_file}")
+    else:
+        print(f"\n(Dry run — no files modified. Use --apply to write changes.)")
+
+
+def _find_claim_line(content: str, claim_text: str) -> Optional[str]:
+    """Find the full line in content that contains the claim text."""
+    # The claim text might be a substring of the full line (numbering stripped, etc.)
+    # Try increasingly aggressive matching
+    for line in content.splitlines():
+        # Strip common markdown prefixes for comparison
+        stripped = line.lstrip("- ").lstrip("0123456789.").strip()
+        if claim_text in line or claim_text.strip() in stripped:
+            return line
+
+    # Try matching just the substantive part (skip numbers/bullets)
+    import re
+    # Extract the core content from the claim text (skip leading "N. ")
+    core = re.sub(r'^\d+\.\s*', '', claim_text).strip()
+    if len(core) > 20:
+        for line in content.splitlines():
+            if core[:40] in line:
+                return line
+
+    return None
+
+
+def _update_verification_tag(line: str, new_tag: str) -> str:
+    """Update or append a verification tag on a line."""
+    import re
+    # Replace existing verification tags
+    tag_pattern = r'\[(?:v[12]:\s*[^\]]*|unverified|FAILED:\s*[^\]]*)\]'
+    if re.search(tag_pattern, line):
+        return re.sub(tag_pattern, new_tag, line, count=1)
+    # No existing tag — append
+    return line.rstrip() + f" {new_tag}"
+
+
+def _find_git_rename(missing_path: str) -> Optional[str]:
+    """Use git log --diff-filter=R to find if a file was renamed."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "log", "--diff-filter=R", "--summary", "--all",
+             "-n", "5", "--", missing_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+
+        # Parse rename lines: " rename X => Y (NNN%)"
+        import re
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            # Match patterns like "rename old/path => new/path (100%)"
+            m = re.search(r'rename\s+(.+?)\s*=>\s*(.+?)\s*\(', line)
+            if m:
+                # The new path is the destination of the rename
+                new_path = m.group(2).strip()
+                if Path(new_path).exists():
+                    return new_path
+
+            # Also match "{old => new}/rest" brace format
+            m = re.search(r'\{(.+?)\s*=>\s*(.+?)\}', line)
+            if m:
+                # Need the full path context around the braces
+                full_match = re.search(r'rename\s+(.*?\{.+?\s*=>\s*.+?\}.*?)\s*\(', line)
+                if full_match:
+                    rename_expr = full_match.group(1)
+                    # Expand {old => new} into the new path
+                    new_expr = re.sub(r'\{[^}]*=>\s*([^}]*)\}', r'\1', rename_expr)
+                    new_expr = new_expr.replace('//', '/')
+                    if Path(new_expr).exists():
+                        return new_expr
+
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
 
 
 def cmd_lint(args):
@@ -870,7 +1603,7 @@ def cmd_check_supports(args):
         try:
             from .supports import fix_zombies
         except ImportError:
-            from core.confab.supports import fix_zombies
+            from confab.supports import fix_zombies
 
         dry_run = args.dry_run
         result = fix_zombies(tree_path=args.tree, dry_run=dry_run)

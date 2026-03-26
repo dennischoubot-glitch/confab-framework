@@ -23,7 +23,11 @@ Quick start (Python API)::
 See DESIGN.md for architecture.
 """
 
-from .config import ConfabConfig, get_config, load_config, set_config
+from .config import (
+    ConfabConfig, get_config, load_config, set_config,
+    parse_volatility, adjust_thresholds, VOLATILITY_PRESETS,
+)
+from .signals import compute_volatility_from_market_scan
 from .gate import run_gate, quick_check, GateReport, ConfabGate
 from .claims import extract_claims, extract_claims_from_file, Claim, ClaimType
 from .verify import verify_claim, verify_all, VerificationResult, VerificationOutcome
@@ -32,7 +36,7 @@ from .middleware import (
     ConfabVerificationError, VerificationReport,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     # High-level API
@@ -42,6 +46,8 @@ __all__ = [
     "ConfabVerificationError", "VerificationReport",
     # Configuration
     "ConfabConfig", "get_config", "load_config", "set_config",
+    "parse_volatility", "adjust_thresholds", "VOLATILITY_PRESETS",
+    "compute_volatility_from_market_scan",
     # Gate (function-based)
     "run_gate", "quick_check", "GateReport",
     # Claims

@@ -1,0 +1,19 @@
+[confab]
+# Files to scan for carry-forward claims
+files_to_scan = [
+    "handoff.md",
+]
+
+# How many gate runs before unverified claims are flagged stale
+stale_threshold = 3
+
+# Where to store the tracker database
+db_path = "confab_tracker.db"
+
+# Known environment variable names to detect in claims
+[confab.env_vars]
+known = ["STRIPE_SECRET_KEY", "AWS_ACCESS_KEY_ID", "DATABASE_URL"]
+
+# Pipeline output mappings: script -> expected output paths
+[confab.pipelines]
+"scripts/migrate_v3.py" = ["migrations/"]

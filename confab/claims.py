@@ -175,6 +175,18 @@ COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Directive/constraint patterns — lines that prescribe limits or rules, not factual
+# count assertions. e.g. "1-2 entries per day maximum" is a limit, not a count claim.
+DIRECTIVE_RE = re.compile(
+    r'\b(?:maximum|minimum|max|min|limit|per\s+(?:day|hour|week|sprint|session)'
+    r'|at\s+most|at\s+least|no\s+more\s+than|up\s+to|cap\s+(?:of|at)'
+    r'|should\s+(?:not\s+exceed|be\s+(?:under|below|above))'
+    r'|(?:redirect|redirect\s+to|when\s+today)'
+    r'|already\s+published\s+today'
+    r'|well\s+over\s+the)\b',
+    re.IGNORECASE,
+)
+
 # Narrative context patterns — lines that describe what happened (past tense),
 # not assertions about current system state. These should not trigger claim extraction.
 NARRATIVE_RE = re.compile(
@@ -389,7 +401,7 @@ def extract_claims(
 
         # --- Count/quantity claims ---
         count_matches = COUNT_RE.findall(line)
-        if count_matches and _is_assertion_context(line):
+        if count_matches and _is_assertion_context(line) and not _is_directive_context(line):
             claim = Claim(
                 text=stripped,
                 claim_type=ClaimType.COUNT_CLAIM,
@@ -431,6 +443,19 @@ def _is_assertion_context(line: str) -> bool:
     }
     lower = line.lower()
     return any(word in lower for word in assertion_words)
+
+
+def _is_directive_context(line: str) -> bool:
+    """Check if a line is a directive/constraint rather than a factual count assertion.
+
+    Lines like "1-2 journal entries per day maximum" prescribe a limit — they are
+    not asserting the current count of entries. Similarly, "7 entries already
+    published today" is a time-windowed status that shouldn't be compared against
+    the total entry count without proper time filtering.
+
+    Returns True if the line looks like a directive, constraint, or limit.
+    """
+    return bool(DIRECTIVE_RE.search(line))
 
 
 def _is_optional_reference(line: str) -> bool:

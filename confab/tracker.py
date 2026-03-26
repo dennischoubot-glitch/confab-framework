@@ -43,6 +43,7 @@ class TrackingStatus(Enum):
     FAILED = "failed"            # Failed verification
     INCONCLUSIVE = "inconclusive"  # Couldn't determine
     STALE = "stale"              # Exceeded run threshold without verification
+    QUARANTINED = "quarantined"  # Moved to quarantine section after persistent staleness
     EXPIRED = "expired"          # No longer appears in scanned files
 
 
@@ -166,6 +167,19 @@ def _get_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_cascade_run
         ON cascade_history(gate_run_id)
+    """)
+    # Fix actions — audit log for confab fix remediation actions.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fix_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            claim_hash TEXT,
+            claim_text TEXT NOT NULL,
+            action TEXT NOT NULL,
+            file_modified TEXT,
+            detail TEXT,
+            FOREIGN KEY (claim_hash) REFERENCES tracked_claims(claim_hash)
+        )
     """)
     conn.commit()
     return conn
@@ -675,6 +689,69 @@ def get_audit_data(
         "unresolved_cascaders": unresolved_cascaders,
         "recent_runs": recent_runs,
     }
+
+
+def record_fix_action(
+    claim_text: str,
+    action: str,
+    file_modified: Optional[str] = None,
+    detail: Optional[str] = None,
+    claim_hash: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> int:
+    """Record a fix action in the audit log. Returns the action ID."""
+    conn = _get_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute("""
+        INSERT INTO fix_actions (timestamp, claim_hash, claim_text, action, file_modified, detail)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (now, claim_hash, claim_text, action, file_modified, detail))
+    action_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return action_id
+
+
+def get_fix_history(
+    limit: int = 20,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Get recent fix actions from the audit log."""
+    conn = _get_db(db_path)
+    rows = conn.execute("""
+        SELECT * FROM fix_actions ORDER BY id DESC LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_claim_status(
+    claim_hash: str,
+    status: str,
+    evidence: Optional[str] = None,
+    method: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Update a tracked claim's status. Returns True if the claim existed."""
+    conn = _get_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    parts = ["status = ?", "last_verified = ?"]
+    vals: list = [status, now]
+    if evidence is not None:
+        parts.append("evidence = ?")
+        vals.append(evidence)
+    if method is not None:
+        parts.append("verification_method = ?")
+        vals.append(method)
+    vals.append(claim_hash)
+    cur = conn.execute(
+        f"UPDATE tracked_claims SET {', '.join(parts)} WHERE claim_hash = ?",
+        vals,
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
 
 
 def _row_to_tracked(row: sqlite3.Row) -> TrackedClaim:

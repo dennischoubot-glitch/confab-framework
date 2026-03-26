@@ -25,8 +25,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# Default path relative to workspace root
-DEFAULT_TREE_PATH = "core/knowledge/KNOWLEDGE_TREE.json"
+# Default path relative to workspace root — overridden by ia_defaults when in ia repo
+def _default_tree_path() -> str:
+    try:
+        from . import _ia_defaults as ia
+        return ia.TREE_PATH
+    except ImportError:
+        return "knowledge_tree.json"
+
+DEFAULT_TREE_PATH = _default_tree_path()
 
 # Entry types that have supports pointing downward
 SUPPORTED_TYPES = {"idea", "principle", "truth"}
@@ -66,6 +73,29 @@ class WeakEntry:
         """More than 50% of effective supports are dead or missing, but not all."""
         return not self.is_zombie and self.dead_ratio > 0.5
 
+    @property
+    def is_degraded(self) -> bool:
+        """Any dead effective supports, but not zombie or weakened (<= 50%)."""
+        return not self.is_zombie and not self.is_weakened and self.effective_dead > 0
+
+    @property
+    def severity(self) -> str:
+        """Classification label: ZOMBIE > WEAKENED > DEGRADED > HEALTHY."""
+        if self.is_zombie:
+            return "ZOMBIE"
+        if self.is_weakened:
+            return "WEAKENED"
+        if self.is_degraded:
+            return "DEGRADED"
+        return "HEALTHY"
+
+    @property
+    def raw_dead_ratio(self) -> float:
+        """Dead ratio including observation deaths (raw, not effective)."""
+        if self.total_supports == 0:
+            return 0.0
+        return (self.dead_supports + len(self.missing_ids)) / self.total_supports
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.entry_id,
@@ -78,6 +108,8 @@ class WeakEntry:
             "effective_dead": self.effective_dead,
             "effective_total": self.effective_total,
             "dead_ratio": round(self.dead_ratio, 3),
+            "raw_dead_ratio": round(self.raw_dead_ratio, 3),
+            "severity": self.severity,
             "zombie": self.is_zombie,
             "dead_ids": self.dead_ids,
             "missing_ids": self.missing_ids,
@@ -93,11 +125,12 @@ class SupportsReport:
     total_supports_checked: int
     zombies: List[WeakEntry]
     weakened: List[WeakEntry]
+    degraded: List[WeakEntry]  # any dead supports but <= 50%
     healthy: int
     no_supports: int  # entries in supported types that have empty supports
     invalidated_count: int  # total invalidated entries in tree
-    by_type: Dict[str, Dict[str, int]]  # type -> {checked, zombie, weakened, healthy}
-    by_domain: Dict[str, Dict[str, int]]  # domain -> {checked, zombie, weakened}
+    by_type: Dict[str, Dict[str, int]]  # type -> {checked, zombie, weakened, degraded, healthy}
+    by_domain: Dict[str, Dict[str, int]]  # domain -> {checked, zombie, weakened, degraded}
 
     @property
     def has_zombies(self) -> bool:
@@ -107,6 +140,10 @@ class SupportsReport:
     def has_issues(self) -> bool:
         return len(self.zombies) > 0 or len(self.weakened) > 0
 
+    @property
+    def has_any_degradation(self) -> bool:
+        return self.has_issues or len(self.degraded) > 0
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "tree_path": self.tree_path,
@@ -115,6 +152,7 @@ class SupportsReport:
             "total_supports_checked": self.total_supports_checked,
             "zombies": len(self.zombies),
             "weakened": len(self.weakened),
+            "degraded": len(self.degraded),
             "healthy": self.healthy,
             "no_supports": self.no_supports,
             "invalidated_count": self.invalidated_count,
@@ -122,6 +160,7 @@ class SupportsReport:
             "by_domain": self.by_domain,
             "zombie_details": [z.to_dict() for z in self.zombies],
             "weakened_details": [w.to_dict() for w in self.weakened],
+            "degraded_details": [d.to_dict() for d in self.degraded],
         }
 
     def format_report(self) -> str:
@@ -133,9 +172,12 @@ class SupportsReport:
         lines.append(f"Entries with supports: {self.checked_entries}")
         lines.append(f"Support references checked: {self.total_supports_checked}")
 
-        if not self.has_issues:
-            lines.append("\n**SUPPORTS: CLEAN** — No zombie or weakened entries found.")
+        if not self.has_any_degradation:
+            lines.append("\n**SUPPORTS: CLEAN** — No zombie, weakened, or degraded entries found.")
             return "\n".join(lines)
+
+        if not self.has_issues and self.degraded:
+            lines.append(f"\n**SUPPORTS: OK** — No zombies or weakened, but {len(self.degraded)} degraded entries have some dead supports.")
 
         if self.zombies:
             lines.append(f"\n## ZOMBIE ENTRIES ({len(self.zombies)})")
@@ -169,32 +211,53 @@ class SupportsReport:
                 lines.append(f"  Supports: {w.total_supports} total, {w.dead_supports} invalidated, {len(w.missing_ids)} missing")
                 lines.append("")
 
+        if self.degraded:
+            lines.append(f"\n## DEGRADED ENTRIES ({len(self.degraded)})")
+            lines.append("")
+            lines.append("Some supports are dead (≤50%) — monitor for further decay:")
+            lines.append("")
+            for d in self.degraded[:20]:
+                pct = int(d.dead_ratio * 100)
+                lines.append(f"**{d.entry_id}** ({d.entry_type}, {d.domain or 'unset'}) — {pct}% degraded ({d.effective_dead}/{d.effective_total} dead)")
+                lines.append(f"  {d.content[:120]}")
+                if d.dead_ids:
+                    dead_non_obs = [s for s in d.dead_ids if not _looks_like_observation(s)] if d.entry_type == "idea" else d.dead_ids
+                    if dead_non_obs:
+                        lines.append(f"  Dead: {', '.join(dead_non_obs[:5])}{' ...' if len(dead_non_obs) > 5 else ''}")
+                lines.append("")
+            if len(self.degraded) > 20:
+                lines.append(f"  ...and {len(self.degraded) - 20} more degraded entries (use --json for full list)")
+                lines.append("")
+
         # Summary by type
         lines.append("## Summary by Type")
         for entry_type in ["idea", "principle", "truth"]:
             if entry_type in self.by_type:
                 t = self.by_type[entry_type]
-                lines.append(f"- **{entry_type}**: {t['checked']} checked, {t['zombie']} zombie, {t['weakened']} weakened, {t['healthy']} healthy")
+                lines.append(f"- **{entry_type}**: {t['checked']} checked, {t['zombie']} zombie, {t['weakened']} weakened, {t['degraded']} degraded, {t['healthy']} healthy")
 
         # Summary by domain (top offenders)
         if self.by_domain:
-            lines.append("\n## Zombie Rate by Domain")
+            lines.append("\n## Degradation Rate by Domain")
             domain_items = sorted(
                 self.by_domain.items(),
-                key=lambda x: (x[1]["zombie"] + x[1]["weakened"]) / max(x[1]["checked"], 1),
+                key=lambda x: (x[1]["zombie"] + x[1]["weakened"] + x[1]["degraded"]) / max(x[1]["checked"], 1),
                 reverse=True,
             )
             for domain, counts in domain_items[:10]:
                 if counts["checked"] == 0:
                     continue
-                rate = (counts["zombie"] + counts["weakened"]) / counts["checked"] * 100
-                lines.append(f"- {domain or 'unset'}: {rate:.0f}% degraded ({counts['zombie']} zombie, {counts['weakened']} weakened / {counts['checked']} checked)")
+                total_issues = counts["zombie"] + counts["weakened"] + counts["degraded"]
+                if total_issues == 0:
+                    continue
+                rate = total_issues / counts["checked"] * 100
+                lines.append(f"- {domain or 'unset'}: {rate:.0f}% ({counts['zombie']} zombie, {counts['weakened']} weakened, {counts['degraded']} degraded / {counts['checked']} checked)")
 
         return "\n".join(lines)
 
     def format_slack(self) -> str:
         """Concise Slack-friendly output."""
-        if not self.has_issues:
+        if not self.has_any_degradation:
             return f":white_check_mark: Supports CLEAN — {self.checked_entries} entries checked, all healthy"
 
         parts = []
@@ -202,6 +265,8 @@ class SupportsReport:
             parts.append(f":skull: {len(self.zombies)} zombie")
         if self.weakened:
             parts.append(f":warning: {len(self.weakened)} weakened")
+        if self.degraded:
+            parts.append(f":large_yellow_circle: {len(self.degraded)} degraded")
         parts.append(f":white_check_mark: {self.healthy} healthy")
 
         lines = [" | ".join(parts)]
@@ -266,6 +331,7 @@ def check_supports(
 
     zombies: List[WeakEntry] = []
     weakened: List[WeakEntry] = []
+    degraded: List[WeakEntry] = []
     healthy_count = 0
     no_supports_count = 0
     total_supports_checked = 0
@@ -315,9 +381,9 @@ def check_supports(
 
         # Initialize type/domain counters
         if entry_type not in by_type:
-            by_type[entry_type] = {"checked": 0, "zombie": 0, "weakened": 0, "healthy": 0}
+            by_type[entry_type] = {"checked": 0, "zombie": 0, "weakened": 0, "degraded": 0, "healthy": 0}
         if domain not in by_domain:
-            by_domain[domain] = {"checked": 0, "zombie": 0, "weakened": 0}
+            by_domain[domain] = {"checked": 0, "zombie": 0, "weakened": 0, "degraded": 0}
 
         by_type[entry_type]["checked"] += 1
         by_domain[domain]["checked"] += 1
@@ -343,13 +409,18 @@ def check_supports(
             weakened.append(weak)
             by_type[entry_type]["weakened"] += 1
             by_domain[domain]["weakened"] += 1
+        elif weak.is_degraded:
+            degraded.append(weak)
+            by_type[entry_type]["degraded"] += 1
+            by_domain[domain]["degraded"] += 1
         else:
             healthy_count += 1
             by_type[entry_type]["healthy"] += 1
 
-    # Sort zombies and weakened by dead ratio descending
+    # Sort by dead ratio descending within each severity
     zombies.sort(key=lambda w: (-w.dead_ratio, w.entry_id))
     weakened.sort(key=lambda w: (-w.dead_ratio, w.entry_id))
+    degraded.sort(key=lambda w: (-w.dead_ratio, -w.effective_dead, w.entry_id))
 
     checked = sum(t["checked"] for t in by_type.values())
 
@@ -360,6 +431,7 @@ def check_supports(
         total_supports_checked=total_supports_checked,
         zombies=zombies,
         weakened=weakened,
+        degraded=degraded,
         healthy=healthy_count,
         no_supports=no_supports_count,
         invalidated_count=len(invalidated_ids),

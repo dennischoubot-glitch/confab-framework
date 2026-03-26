@@ -13,7 +13,8 @@ pip install confab-framework
 Or from source:
 
 ```bash
-pip install -e ./core/confab
+git clone https://github.com/dennischoubot-glitch/confab-framework.git
+pip install -e ./confab-framework
 ```
 
 ## Quick Start
@@ -76,10 +77,12 @@ See `examples/middleware_example.py` for a complete walkthrough.
 ### Standalone text verification
 
 ```python
-from confab.middleware import verify_text
+from confab import verify_text
 
-report = verify_text("The model at /models/latest.bin is loaded.")
+report = verify_text("The model at /models/latest.bin is ready.")
 print(report.summary())
+# → confab: 1 FAILED of 1 claims
+#     - The model at /models/latest.bin is ready.: File not found: /models/latest.bin
 ```
 
 ## How It Works
@@ -87,6 +90,12 @@ print(report.summary())
 Agents in multi-agent systems pass claims forward at handoff points — "the pipeline is blocked on X," "file Y exists," "the config is ready." When an agent states a falsehood confidently, the next agent copies it forward. The confab framework breaks this cascade by extracting claims from handoff text, auto-verifying them against reality (filesystem, environment variables, script syntax, config parsing, pipeline outputs), and tracking how long unverified claims persist. Claims that fail verification get flagged; claims that linger without verification get marked stale. The gate runs at every agent handoff point, supplying the oracle bits that distinguish confabulation from understanding.
 
 The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiability) → **Verify** (check against ground truth) → **Track** (SQLite persistence across runs) → **Report** (failures + staleness + tree health).
+
+### Assertion Context Detection
+
+The extractor only flags lines that contain assertion language — words like *ready*, *deployed*, *working*, *blocked*, *missing*, *configured*, *operational*, etc. A line that merely references a file path (e.g., "see config/app.toml for details") is not treated as a claim. A line that asserts something about a file (e.g., "config/app.toml is ready") is.
+
+This avoids false positives from documentation, comments, and references while catching the actual assertions that propagate through agent handoffs.
 
 ## Commands
 
@@ -140,6 +149,7 @@ The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiabili
 [confab]
 files_to_scan = ["docs/priorities.md", "notes/handoff.md"]
 stale_threshold = 3
+# volatility = "medium"  # Adaptive thresholds: low/medium/high or 0.0-1.0
 db_path = "confab_tracker.db"
 
 [confab.env_vars]
@@ -186,6 +196,39 @@ Without a config file, the framework auto-detects context and uses sensible defa
 Transient claims about runtime state (API responses, process status, pipeline outputs) go stale faster than structural claims. The gate auto-expires behavior claims after 6 hours — if a claim's verification tag is older than the TTL, it's flagged for re-verification rather than trusted blindly.
 
 This catches the pattern where "pipeline is working [v1: verified yesterday]" persists in a handoff file long after the pipeline broke.
+
+### Adaptive Thresholds (Volatility)
+
+The gate's thresholds can adapt to environmental conditions. In volatile periods (market regime changes, geopolitical shifts, rapid deployment), the gate loosens — faster adaptation matters more than rigorous verification. In stable periods, the gate tightens — integrity preservation matters more.
+
+```bash
+confab gate --volatility high       # looser: stale threshold ↑, TTL ↑
+confab gate --volatility low        # tighter: stale threshold ↓, TTL ↓
+confab gate --volatility 0.8        # numeric: 0.0 (tightest) to 1.0 (loosest)
+confab ci --volatility medium       # works in CI mode too
+```
+
+Python API:
+
+```python
+from confab import ConfabGate
+
+# Set volatility at init (persists for all runs)
+gate = ConfabGate("confab.toml", volatility=0.8)
+report = gate.run()
+
+# Or override per-run
+report = gate.run(volatility=0.3)
+```
+
+Configure a default in `confab.toml`:
+
+```toml
+[confab]
+volatility = "medium"   # or 0.0–1.0
+```
+
+Named presets: `low` (0.2), `medium` (0.5), `high` (0.8). At `medium`, thresholds are unchanged. At `high`, the stale threshold rises ~60% and TTL doubles. At `low`, thresholds drop ~30%.
 
 ## Diagnostics
 

@@ -30,8 +30,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-# Default path relative to workspace root
-DEFAULT_TREE_PATH = "core/knowledge/KNOWLEDGE_TREE.json"
+# Default path relative to workspace root — overridden by ia_defaults when in ia repo
+def _default_tree_path() -> str:
+    try:
+        from . import _ia_defaults as ia
+        return ia.TREE_PATH
+    except ImportError:
+        return "knowledge_tree.json"
+
+DEFAULT_TREE_PATH = _default_tree_path()
 
 # Default staleness threshold for unverified observations
 DEFAULT_STALE_DAYS = 14
