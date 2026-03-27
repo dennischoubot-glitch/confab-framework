@@ -100,6 +100,8 @@ Usage:
     confab gate --config /path/to/confab.toml
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
