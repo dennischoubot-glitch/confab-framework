@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from confab.config import ConfabConfig, set_config, reset_config
 from confab.gate import run_gate, quick_check, GateReport, STALE_BUILD_THRESHOLD
@@ -195,7 +196,8 @@ class TestQuickCheck(unittest.TestCase):
     def tearDown(self):
         reset_config()
 
-    def test_quick_check_clean(self):
+    @patch("confab.gate._slots_elapsed_now", return_value=5)
+    def test_quick_check_clean(self, _mock_slots):
         result = quick_check()
         self.assertIn("CLEAN", result)
 
