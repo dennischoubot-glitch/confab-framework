@@ -38,8 +38,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          pip install build
+          pip install -e .
+          pip install build pytest
 
       - name: Run tests
         run: python -m pytest tests/ -q
