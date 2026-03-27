@@ -32,11 +32,11 @@ from typing import Any, Dict, List, Optional
 
 # Default path relative to workspace root — overridden by ia_defaults when in ia repo
 def _default_tree_path() -> str:
-    try:
-        from . import _ia_defaults as ia
+    from .config import load_ia_defaults_module
+    ia = load_ia_defaults_module()
+    if ia is not None and hasattr(ia, "TREE_PATH"):
         return ia.TREE_PATH
-    except ImportError:
-        return "knowledge_tree.json"
+    return "knowledge_tree.json"
 
 DEFAULT_TREE_PATH = _default_tree_path()
 

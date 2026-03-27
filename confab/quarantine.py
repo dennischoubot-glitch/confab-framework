@@ -389,10 +389,11 @@ def _post_quarantine_slack(result: QuarantineResult) -> bool:
 
     channel = os.environ.get("CONFAB_SLACK_CHANNEL")
     if not channel:
-        try:
-            from . import _ia_defaults as ia
+        from .config import load_ia_defaults_module
+        ia = load_ia_defaults_module()
+        if ia is not None and hasattr(ia, "SLACK_CHANNEL"):
             channel = ia.SLACK_CHANNEL
-        except ImportError:
+        else:
             print("CONFAB_SLACK_CHANNEL not set — skipping Slack notification",
                   file=sys.stderr)
             return False

@@ -61,6 +61,7 @@ Both were **verifiable claims about system state** that persisted because no age
 | `pipeline_blocked` | Yes | Test the blocker condition |
 | `script_runs` | Yes | Import check or syntax check |
 | `config_present` | Yes | Parse JSON/YAML/TOML/INI, check key existence (dot notation) |
+| `process_status` | Yes | Check supervisorctl/systemd/pgrep, pid files, port probes |
 | `fact_claim` | Partially | Check knowledge tree, git history |
 | `status_claim` | Partially | Check git status, process status |
 | `subjective` | No | Requires human/agent judgment |

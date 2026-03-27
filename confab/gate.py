@@ -57,6 +57,10 @@ STALE_BUILD_THRESHOLD = 3
 JOURNAL_PUBLISH_HOURS_PST = [4, 7, 12, 16, 19]
 PST = ZoneInfo("America/Los_Angeles")
 
+# Responder cadence: 1 run/day, 5 replies max, 1 original note (Dennis directive, Mar 26)
+RESPONDER_DAILY_REPLY_LIMIT = 5
+RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 1
+
 
 def _slots_elapsed_now() -> int:
     """Count how many journal publish slots have elapsed based on current PST time."""
@@ -131,6 +135,87 @@ def check_journal_cadence() -> Dict[str, Any]:
     }
 
 
+def check_responder_cadence() -> Dict[str, Any]:
+    """Check Substack responder cadence against daily limits.
+
+    Limits (Dennis directive, Mar 26):
+    - 1 run per day (enforced in responder script)
+    - 5 note replies per day
+    - 1 original note per day
+
+    Returns:
+        Dict with replies_today, original_notes_today, has_run_today, status, message.
+    """
+    import sqlite3
+
+    config = get_config()
+    responder_db = config.workspace_root / "projects" / "synthesis" / "scripts" / "substack_responder.db"
+    original_queue = config.workspace_root / "projects" / "synthesis" / "scripts" / "original_notes_queue.json"
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    replies_today = 0
+    has_run = False
+
+    if responder_db.exists():
+        try:
+            db = sqlite3.connect(str(responder_db))
+            row = db.execute(
+                "SELECT COUNT(*) FROM replies WHERE posted_at LIKE ? AND success = 1 AND dry_run = 0",
+                (f"{today}%",)
+            ).fetchone()
+            replies_today = row[0] if row else 0
+
+            # Check all tables for any activity today
+            for table in ("replies", "restacks", "post_comments", "thread_replies"):
+                row = db.execute(
+                    f"SELECT 1 FROM {table} WHERE posted_at LIKE ? AND success = 1 AND dry_run = 0 LIMIT 1",
+                    (f"{today}%",)
+                ).fetchone()
+                if row:
+                    has_run = True
+                    break
+            db.close()
+        except sqlite3.Error:
+            pass
+
+    original_notes_today = 0
+    if original_queue.exists():
+        try:
+            queue = json.loads(original_queue.read_text())
+            today_local = datetime.now(PST).strftime("%Y-%m-%d")
+            original_notes_today = sum(
+                1 for n in queue
+                if n.get("posted") and n.get("posted_at", "").startswith(today_local)
+            )
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    replies_remaining = max(0, RESPONDER_DAILY_REPLY_LIMIT - replies_today)
+    notes_remaining = max(0, RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT - original_notes_today)
+    run_blocked = has_run
+    replies_blocked = replies_today >= RESPONDER_DAILY_REPLY_LIMIT
+    notes_blocked = original_notes_today >= RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT
+
+    status = "BLOCKED" if (run_blocked and replies_blocked and notes_blocked) else "OK"
+
+    parts = []
+    parts.append(f"run={'done' if has_run else 'available'}")
+    parts.append(f"replies={replies_today}/{RESPONDER_DAILY_REPLY_LIMIT}")
+    parts.append(f"notes={original_notes_today}/{RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT}")
+
+    return {
+        "status": status,
+        "has_run_today": has_run,
+        "replies_today": replies_today,
+        "replies_limit": RESPONDER_DAILY_REPLY_LIMIT,
+        "replies_remaining": replies_remaining,
+        "original_notes_today": original_notes_today,
+        "original_notes_limit": RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT,
+        "original_notes_remaining": notes_remaining,
+        "message": f"RESPONDER CADENCE: {status} ({', '.join(parts)})",
+    }
+
+
 @dataclass
 class GateReport:
     """Result of running the cascade gate."""
@@ -149,6 +234,7 @@ class GateReport:
     registry_violations: List[Dict[str, Any]] = field(default_factory=list)
     ttl_expired: List[Dict[str, Any]] = field(default_factory=list)  # Behavior claims past TTL
     journal_cadence: Optional[Dict[str, Any]] = None  # Time-slot-based journal limit
+    responder_cadence: Optional[Dict[str, Any]] = None  # Daily responder limits
     # Tracker metadata (populated when tracker is enabled)
     tracker_new: int = 0           # Claims seen for the first time
     tracker_returning: int = 0     # Claims seen before
@@ -165,6 +251,10 @@ class GateReport:
     @property
     def journal_blocked(self) -> bool:
         return bool(self.journal_cadence and self.journal_cadence.get("status") == "BLOCKED")
+
+    @property
+    def responder_blocked(self) -> bool:
+        return bool(self.responder_cadence and self.responder_cadence.get("status") == "BLOCKED")
 
     @property
     def has_registry_violations(self) -> bool:
@@ -193,6 +283,7 @@ class GateReport:
             "registry_violations": self.registry_violations,
             "ttl_expired": self.ttl_expired,
             "journal_cadence": self.journal_cadence,
+            "responder_cadence": self.responder_cadence,
             "clean": self.clean,
             "failed_details": self.failed_details,
             "stale_details": self.stale_details,
@@ -225,6 +316,19 @@ class GateReport:
                 lines.append(f"- Next slot: {jc['next_slot']}")
             if jc["status"] == "BLOCKED":
                 lines.append("- **No more journal entries until next slot opens.**")
+
+        # Responder cadence — always show
+        if self.responder_cadence:
+            rc = self.responder_cadence
+            status_icon = "BLOCKED" if rc["status"] == "BLOCKED" else "OK"
+            lines.append(f"\n## Responder Cadence: {status_icon}")
+            lines.append(f"- Run today: {'yes' if rc['has_run_today'] else 'no'}")
+            lines.append(f"- Replies: {rc['replies_today']}/{rc['replies_limit']}"
+                         f" ({rc['replies_remaining']} remaining)")
+            lines.append(f"- Original notes: {rc['original_notes_today']}/{rc['original_notes_limit']}"
+                         f" ({rc['original_notes_remaining']} remaining)")
+            if rc["status"] == "BLOCKED":
+                lines.append("- **Responder daily budget exhausted.**")
 
         if self.clean and not self.journal_blocked:
             lines.append("\n**GATE: CLEAN** — No failed verifications or stale claims.")
@@ -635,6 +739,9 @@ def run_gate(
     # Journal cadence check (time-slot-based)
     journal_cadence = check_journal_cadence()
 
+    # Responder cadence check (daily limits)
+    responder_cadence = check_responder_cadence()
+
     # Count results
     result_counts = {}
     for o in outcomes:
@@ -658,6 +765,7 @@ def run_gate(
         registry_violations=registry_violations,
         ttl_expired=ttl_expired,
         journal_cadence=journal_cadence,
+        responder_cadence=responder_cadence,
         tracker_new=tracker_new,
         tracker_returning=tracker_returning,
         tracker_total_runs=tracker_total_runs,

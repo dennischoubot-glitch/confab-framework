@@ -43,6 +43,7 @@ exclude_sections = [
 ```
 """
 
+import importlib.util
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -196,12 +197,33 @@ def _is_ia_repo(root: Path) -> bool:
     )
 
 
+def load_ia_defaults_module(workspace_root: Optional[Path] = None):
+    """Load ia-specific defaults from the filesystem (not from the package).
+
+    The defaults file lives at core/confab_ia_defaults.py in the ia repo,
+    outside the confab package directory so it's excluded from PyPI builds.
+    Returns the module or None if not found.
+    """
+    if workspace_root is None:
+        workspace_root = _detect_workspace_root()
+    defaults_path = workspace_root / "core" / "confab_ia_defaults.py"
+    if not defaults_path.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "confab_ia_defaults", str(defaults_path)
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
 def _load_ia_defaults(workspace_root: Path) -> "ConfabConfig":
     """Load ia-specific defaults. Only called when inside the ia repo."""
-    try:
-        from . import _ia_defaults as ia
-    except ImportError:
-        # _ia_defaults not available (standalone install) — empty config
+    ia = load_ia_defaults_module(workspace_root)
+    if ia is None:
         return ConfabConfig(workspace_root=workspace_root, files_to_scan=[])
     return ConfabConfig(
         workspace_root=workspace_root,

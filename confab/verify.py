@@ -500,6 +500,10 @@ def verify_process_status(claim: Claim) -> VerificationOutcome:
     claim_lower = claim.text.lower()
     now = datetime.now(timezone.utc).isoformat()
 
+    # Route blanket "all services" claims to the comprehensive checker
+    if _is_all_services_claim(claim.text):
+        return verify_all_services(claim)
+
     # Normalize dashes/spaces for matching — "weather-rewards" and "weather rewards"
     # should both match claims containing either variant. This prevents variant drift
     # where config has one form and claim text uses the other.
@@ -539,11 +543,36 @@ def verify_process_status(claim: Claim) -> VerificationOutcome:
         config_path=matched_service.get("config"),
     )
 
+    # Supplement with pid file check if configured.
+    # Pid file + os.kill is more reliable than pgrep for process name mismatches.
+    pid_file = matched_service.get("pid_file")
+    pid_info = ""
+    if pid_file:
+        pid_status, pid_detail = _check_pid_file(pid_file)
+        pid_info = f"\n  Pid check: {pid_detail}"
+        if pid_status == "running" and actual_status in ("unknown", "stopped"):
+            actual_status = pid_status
+        elif pid_status == "stopped" and actual_status == "unknown":
+            actual_status = pid_status
+
+    # Supplement with port check if configured
+    port = matched_service.get("port")
+    port_info = ""
+    if port:
+        port_host = matched_service.get("host", "127.0.0.1")
+        port_status, port_detail = _check_port(port, port_host)
+        port_info = f"\n  Port check: {port_detail}"
+        if port_status == "running" and actual_status in ("unknown", "stopped"):
+            actual_status = port_status
+        elif port_status == "stopped" and actual_status == "unknown":
+            actual_status = port_status
+
     evidence = (
         f"  Matched keyword '{matched_keyword}' → {service_name}\n"
         f"  Manager: {manager}\n"
         f"  Actual status: {actual_status}\n"
         f"  Detail: {status_detail}"
+        f"{pid_info}{port_info}"
     )
 
     # Compare claim against reality
@@ -667,6 +696,170 @@ def _check_ps(service_name: str) -> tuple:
         return ("unknown", "pgrep timed out")
     except Exception as e:
         return ("unknown", f"Error running pgrep: {e}")
+
+
+def _check_pid_file(pid_file: str) -> tuple:
+    """Check if a process is alive via its pid file.
+
+    Returns (status_string, detail_string).
+    Reads the pid from the file and sends signal 0 to check liveness.
+    """
+    root = _get_workspace_root()
+    pid_path = root / pid_file if not Path(pid_file).is_absolute() else Path(pid_file)
+
+    if not pid_path.exists():
+        return ("unknown", f"pid file {pid_file} does not exist")
+
+    try:
+        pid = int(pid_path.read_text().strip())
+        os.kill(pid, 0)  # Signal 0 = check if process exists
+        return ("running", f"pid {pid} is alive (from {pid_file})")
+    except ValueError:
+        return ("unknown", f"pid file {pid_file} contains non-integer content")
+    except ProcessLookupError:
+        return ("stopped", f"pid {pid} from {pid_file} is not running")
+    except PermissionError:
+        # Process exists but we lack permission — it's alive
+        return ("running", f"pid {pid} exists (permission denied on signal)")
+    except OSError as e:
+        return ("unknown", f"Error checking pid {pid_file}: {e}")
+
+
+def _check_port(port: int, host: str = "127.0.0.1") -> tuple:
+    """Check if a port is accepting connections.
+
+    Returns (status_string, detail_string).
+    Uses a quick socket connect with a 2-second timeout.
+    """
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        if result == 0:
+            return ("running", f"port {port} on {host} is accepting connections")
+        else:
+            return ("stopped", f"port {port} on {host} refused connection (errno {result})")
+    except socket.timeout:
+        return ("stopped", f"port {port} on {host} connection timed out")
+    except OSError as e:
+        return ("unknown", f"Error probing port {port}: {e}")
+
+
+def verify_all_services(claim: Claim) -> VerificationOutcome:
+    """Verify blanket 'all services running' claims by checking every configured service.
+
+    When a claim says "All services RUNNING" (without naming a specific service),
+    this function iterates over ALL configured process_services and checks each one.
+    The claim passes only if every service is in the claimed state.
+
+    Also checks pid files and ports when configured on individual services.
+    """
+    config = get_config()
+    claim_lower = claim.text.lower()
+    now = datetime.now(timezone.utc).isoformat()
+
+    if not config.process_services:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="No process services configured",
+            checked_at=now,
+            method="all_services_check",
+        )
+
+    # Determine what the claim asserts
+    positive_words = {'running', 'active', 'operational', 'healthy', 'up'}
+    negative_words = {'stopped', 'inactive', 'down', 'crashed', 'exited', 'fatal'}
+    claims_running = any(w in claim_lower for w in positive_words)
+    claims_stopped = any(w in claim_lower for w in negative_words)
+
+    # Check each unique service (skip alias entries that point to same service_name)
+    checked = {}  # service_name -> (status, detail, keyword)
+    for keyword, svc_cfg in config.process_services.items():
+        svc_name = svc_cfg.get("service_name", keyword)
+        if svc_name in checked:
+            continue
+
+        manager = svc_cfg.get("manager", "ps")
+        status, detail = _check_process_status(
+            manager=manager,
+            service_name=svc_name,
+            config_path=svc_cfg.get("config"),
+        )
+
+        # Supplement with pid file check if configured.
+        # Pid file + os.kill(pid, 0) is a kernel-level liveness check —
+        # it's more reliable than pgrep for processes whose command line
+        # doesn't match the service_name string (e.g. supervisord).
+        pid_file = svc_cfg.get("pid_file")
+        if pid_file:
+            pid_status, pid_detail = _check_pid_file(pid_file)
+            detail += f" | pid: {pid_detail}"
+            if pid_status == "running" and status in ("unknown", "stopped"):
+                status = pid_status
+            elif pid_status == "stopped" and status == "unknown":
+                status = pid_status
+
+        # Supplement with port check if configured
+        port = svc_cfg.get("port")
+        if port:
+            port_host = svc_cfg.get("host", "127.0.0.1")
+            port_status, port_detail = _check_port(port, port_host)
+            detail += f" | port: {port_detail}"
+            if port_status == "running" and status in ("unknown", "stopped"):
+                status = port_status
+            elif port_status == "stopped" and status == "unknown":
+                status = port_status
+
+        checked[svc_name] = (status, detail, keyword)
+
+    # Build evidence and determine result
+    results = []
+    all_running = True
+    all_stopped = True
+    for svc_name, (status, detail, keyword) in checked.items():
+        is_running = status.lower() in ("running", "active")
+        results.append(f"  {svc_name}: {status.upper()} ({detail})")
+        if not is_running:
+            all_running = False
+        if is_running:
+            all_stopped = False
+
+    evidence = f"  Checked {len(checked)} services:\n" + "\n".join(results)
+
+    if claims_running and all_running:
+        result = VerificationResult.PASSED
+    elif claims_stopped and all_stopped:
+        result = VerificationResult.PASSED
+    elif claims_running and not all_running:
+        failed_svcs = [
+            svc_name for svc_name, (status, _, _) in checked.items()
+            if status.lower() not in ("running", "active")
+        ]
+        result = VerificationResult.FAILED
+        evidence += f"\n  → Claim says ALL RUNNING but {len(failed_svcs)} service(s) not running: {', '.join(failed_svcs)}"
+    elif claims_stopped and not all_stopped:
+        result = VerificationResult.FAILED
+        evidence += "\n  → Claim says STOPPED but some services are still running"
+    else:
+        result = VerificationResult.INCONCLUSIVE
+        evidence += "\n  → Could not determine claim assertion direction"
+
+    return VerificationOutcome(
+        claim=claim,
+        result=result,
+        evidence=evidence,
+        checked_at=now,
+        method="all_services_check",
+    )
+
+
+def _is_all_services_claim(claim_text: str) -> bool:
+    """Detect blanket 'all services' claims that should check every service."""
+    lower = claim_text.lower()
+    return bool(re.search(r'\ball\s+services\b', lower))
 
 
 def verify_status_by_name(claim: Claim) -> VerificationOutcome:

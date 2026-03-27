@@ -18,6 +18,7 @@ from confab.verify import (
     verify_script_syntax,
     verify_config_present,
     verify_process_status,
+    verify_all_services,
     verify_registry,
     verify_claim,
     verify_all,
@@ -28,6 +29,9 @@ from confab.verify import (
     _check_supervisorctl,
     _check_systemd,
     _check_ps,
+    _check_pid_file,
+    _check_port,
+    _is_all_services_claim,
     _verify_test_count,
     _find_scoped_test_dir,
     _find_all_test_dirs,
@@ -465,6 +469,230 @@ class TestVerifyProcessStatus(unittest.TestCase):
             outcome = verify_claim(claim)
             self.assertEqual(outcome.result, VerificationResult.FAILED)
             self.assertEqual(outcome.method, "process_status_check")
+
+
+class TestIsAllServicesClaim(unittest.TestCase):
+    """Test the all-services detection helper."""
+
+    def test_detects_all_services(self):
+        self.assertTrue(_is_all_services_claim("All services RUNNING"))
+        self.assertTrue(_is_all_services_claim("**All services RUNNING** [v1: verified 2026-03-25]"))
+        self.assertTrue(_is_all_services_claim("all services operational"))
+
+    def test_rejects_specific_service(self):
+        self.assertFalse(_is_all_services_claim("Weather rewards monitor: running"))
+        self.assertFalse(_is_all_services_claim("slack-monitor is running"))
+
+
+class TestCheckPidFile(unittest.TestCase):
+    """Test pid file verification."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        set_config(ConfabConfig(workspace_root=Path(self.tmpdir), files_to_scan=[]))
+
+    def tearDown(self):
+        reset_config()
+
+    def test_missing_pid_file(self):
+        status, detail = _check_pid_file("nonexistent.pid")
+        self.assertEqual(status, "unknown")
+        self.assertIn("does not exist", detail)
+
+    def test_pid_alive(self):
+        pid_file = Path(self.tmpdir) / "test.pid"
+        pid_file.write_text(str(os.getpid()))  # Current process is alive
+        status, detail = _check_pid_file(str(pid_file))
+        self.assertEqual(status, "running")
+        self.assertIn("alive", detail)
+
+    def test_pid_dead(self):
+        pid_file = Path(self.tmpdir) / "test.pid"
+        pid_file.write_text("999999999")  # Very unlikely to be alive
+        status, detail = _check_pid_file(str(pid_file))
+        self.assertEqual(status, "stopped")
+
+    def test_invalid_pid(self):
+        pid_file = Path(self.tmpdir) / "test.pid"
+        pid_file.write_text("not-a-number")
+        status, detail = _check_pid_file(str(pid_file))
+        self.assertEqual(status, "unknown")
+        self.assertIn("non-integer", detail)
+
+
+class TestCheckPort(unittest.TestCase):
+    """Test port checking."""
+
+    def test_closed_port(self):
+        # Port 19999 is very unlikely to be in use
+        status, detail = _check_port(19999, "127.0.0.1")
+        self.assertIn(status, ("stopped", "unknown"))
+
+    @patch('socket.socket')
+    def test_open_port(self, mock_socket_cls):
+        mock_sock = mock_socket_cls.return_value
+        mock_sock.connect_ex.return_value = 0
+        status, detail = _check_port(8080)
+        self.assertEqual(status, "running")
+        self.assertIn("accepting connections", detail)
+
+
+class TestVerifyAllServices(unittest.TestCase):
+    """Test blanket 'all services' verification."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config = ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            process_services={
+                "svc-a": {
+                    "manager": "ps",
+                    "service_name": "svc-a",
+                },
+                "svc-b": {
+                    "manager": "ps",
+                    "service_name": "svc-b",
+                },
+            },
+        )
+        set_config(self.config)
+
+    def tearDown(self):
+        reset_config()
+
+    @patch('confab.verify.subprocess.run')
+    def test_all_running_passes(self, mock_run):
+        """All services running + claim says running → PASSED."""
+        mock_run.return_value = type('', (), {
+            'stdout': '12345\n',
+            'stderr': '',
+            'returncode': 0,
+        })()
+        claim = Claim(
+            text="All services RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_all_services(claim)
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
+        self.assertEqual(outcome.method, "all_services_check")
+
+    @patch('confab.verify.subprocess.run')
+    def test_one_stopped_fails(self, mock_run):
+        """One service stopped + claim says all running → FAILED."""
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return type('', (), {
+                    'stdout': '12345\n', 'stderr': '', 'returncode': 0,
+                })()
+            else:
+                return type('', (), {
+                    'stdout': '', 'stderr': '', 'returncode': 1,
+                })()
+        mock_run.side_effect = side_effect
+        claim = Claim(
+            text="All services RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_all_services(claim)
+        self.assertEqual(outcome.result, VerificationResult.FAILED)
+        self.assertIn("not running", outcome.evidence)
+
+    def test_no_services_configured(self):
+        """No process_services → INCONCLUSIVE."""
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            process_services={},
+        ))
+        claim = Claim(
+            text="All services RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_all_services(claim)
+        self.assertEqual(outcome.result, VerificationResult.INCONCLUSIVE)
+
+    @patch('confab.verify.subprocess.run')
+    def test_routes_through_verify_process_status(self, mock_run):
+        """verify_process_status should detect 'all services' and route correctly."""
+        mock_run.return_value = type('', (), {
+            'stdout': '12345\n', 'stderr': '', 'returncode': 0,
+        })()
+        claim = Claim(
+            text="**All services RUNNING** [v1: verified 2026-03-25 6:00AM]",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_process_status(claim)
+        self.assertEqual(outcome.method, "all_services_check")
+
+    @patch('confab.verify.subprocess.run')
+    def test_with_pid_file_supplement(self, mock_run):
+        """Pid file supplements manager check when configured."""
+        # Manager returns unknown
+        mock_run.return_value = type('', (), {
+            'stdout': '', 'stderr': '', 'returncode': 1,
+        })()
+        # Configure service with pid file
+        pid_file = Path(self.tmpdir) / "test.pid"
+        pid_file.write_text(str(os.getpid()))
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            process_services={
+                "svc-a": {
+                    "manager": "ps",
+                    "service_name": "svc-a",
+                    "pid_file": str(pid_file),
+                },
+            },
+        ))
+        claim = Claim(
+            text="All services RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_all_services(claim)
+        self.assertIn("pid", outcome.evidence.lower())
+
+    @patch('confab.verify.subprocess.run')
+    def test_deduplicates_aliases(self, mock_run):
+        """Alias entries pointing to same service_name should only be checked once."""
+        mock_run.return_value = type('', (), {
+            'stdout': '12345\n', 'stderr': '', 'returncode': 0,
+        })()
+        set_config(ConfabConfig(
+            workspace_root=Path(self.tmpdir),
+            files_to_scan=[],
+            process_services={
+                "weather-rewards": {
+                    "manager": "ps",
+                    "service_name": "ia-services:weather-rewards",
+                },
+                "weather monitor": {
+                    "manager": "ps",
+                    "service_name": "ia-services:weather-rewards",
+                },
+                "slack-monitor": {
+                    "manager": "ps",
+                    "service_name": "ia-services:slack-monitor",
+                },
+            },
+        ))
+        claim = Claim(
+            text="All services RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        outcome = verify_all_services(claim)
+        # Should check 2 unique services, not 3
+        self.assertIn("2 services", outcome.evidence)
+        self.assertEqual(outcome.result, VerificationResult.PASSED)
 
 
 class TestVerifyClaim(unittest.TestCase):
