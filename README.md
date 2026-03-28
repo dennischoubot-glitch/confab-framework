@@ -4,6 +4,60 @@ Structural confabulation detection and prevention for multi-agent systems.
 
 Agents state falsehoods confidently. Other agents copy them forward indefinitely. This framework makes verification structural (enforced by code) rather than aspirational (suggested by docs).
 
+## Why
+
+Multi-agent systems have a confabulation cascade problem. Agent A states a falsehood with full confidence — "the config is deployed," "blocked on API key," "tests are passing." Agent B reads A's output, trusts it, and copies the claim into its own handoff. Agent C does the same. By the time a human notices, the false claim has propagated through dozens of builds.
+
+This isn't hypothetical. In one production system, two false claims — "audio pipeline blocked on OPENAI_API_KEY" and "Substack publishing needs cookie refresh" — propagated through **16 consecutive agent builds over 3 days**. Every agent trusted the last agent's notes. Both pipelines worked perfectly the entire time. No agent checked.
+
+The fix isn't better instructions. Agents ignore instructions the same way they ignore documentation. The fix is a **verification gate** that runs at every handoff point, extracts claims from agent output, and checks them against reality — filesystem, environment variables, running processes, pipeline outputs. Claims that contradict reality get flagged before the next agent sees them.
+
+## What It Catches
+
+Run `confab gate` at any agent handoff point:
+
+```
+$ confab gate
+
+# Confabulation Gate Report
+
+Scanned: docs/builder_priorities.md, docs/handoff.md
+Claims found: 5
+Auto-verified: 5
+
+  [FAIL] Config at deploy/config.toml is ready
+         deploy/config.toml: FILE MISSING
+
+  [FAIL] Output at results/report.json verified clean
+         results/report.json: MISSING
+
+  [PASS] Migration at scripts/migrate.py needs review
+         scripts/migrate.py: EXISTS
+
+  [????] Blocked on DATABASE_URL environment variable
+         DATABASE_URL: NOT FOUND in any .env or os.environ
+
+  [????] Data pipeline is working [v1: verified 2026-03-20]
+         Claim is semi-verifiable but lacks specific paths/vars for auto-check
+
+## Summary
+- Passed: 1/5 auto-verified (20%)
+- Failed: 2
+- Inconclusive: 2
+```
+
+The two FAILED claims would have cascaded to the next agent without the gate. The INCONCLUSIVE claims are flagged for manual verification.
+
+## Examples
+
+Working examples in [`examples/`](examples/):
+
+- **[`standalone_scan.py`](examples/standalone_scan.py)** — Scan any markdown file for unverified claims via the Python API or CLI
+- **[`ci_gate_handoff.py`](examples/ci_gate_handoff.py)** — Gate an agent handoff: verify claims before passing work to the next agent
+- **[`github_actions.yml`](examples/github_actions.yml)** — Copy-paste GitHub Actions workflow for CI integration
+
+See also [`examples/multi_agent_demo.py`](examples/multi_agent_demo.py) for a self-contained three-agent cascade simulation.
+
 ## Install
 
 ```bash
@@ -293,7 +347,7 @@ confab audit                         # full audit report
 confab audit --json                  # machine-readable
 ```
 
-## Examples
+## Usage Examples
 
 ### Multi-agent cascade demo
 
