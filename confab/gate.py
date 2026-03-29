@@ -50,46 +50,25 @@ from .verify import (
     summarize_outcomes,
 )
 
-# Staleness threshold: claims unverified after this many build sections
-STALE_BUILD_THRESHOLD = 3
-
-# Journal cadence: 5 entries/day at specific PST times (Dennis directive, Mar 25)
-JOURNAL_PUBLISH_HOURS_PST = [4, 7, 12, 16, 19]
-PST = ZoneInfo("America/Los_Angeles")
-
-# Responder cadence: 1 run/day, 5 replies max, 1 original note (Dennis directive, Mar 26)
-RESPONDER_DAILY_REPLY_LIMIT = 5
-RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 1
-
-
-def _slots_elapsed_now() -> int:
-    """Count how many journal publish slots have elapsed based on current PST time."""
-    now_pst = datetime.now(PST)
-    return sum(1 for h in JOURNAL_PUBLISH_HOURS_PST if now_pst.hour >= h)
-
-
-def _next_slot_pst() -> Optional[int]:
-    """Return the next journal publish hour (PST), or None if all slots passed."""
-    now_pst = datetime.now(PST)
-    for h in JOURNAL_PUBLISH_HOURS_PST:
-        if now_pst.hour < h:
-            return h
-    return None
+# Import operational constants from centralized config (core/config.py)
+# Uses importlib.util to work both as package import and standalone script
+import importlib.util as _ilu
+_cfg_path = Path(__file__).resolve().parent.parent / "config.py"
+_spec = _ilu.spec_from_file_location("ia_config", str(_cfg_path))
+_cfg = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_cfg)
+STALE_BUILD_THRESHOLD = _cfg.STALE_CLAIM_BUILD_THRESHOLD
+PST = _cfg.TIMEZONE
+RESPONDER_DAILY_REPLY_LIMIT = _cfg.SUBSTACK_DAILY_REPLY_LIMIT
+RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = _cfg.SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT
 
 
 def check_journal_cadence() -> Dict[str, Any]:
-    """Check journal cadence against time-slot-based limit.
+    """Check journal cadence — informational only, no limit enforced.
 
-    The allowed number of journal entries increases as publish slots pass:
-    - Before 4am PST: 0 allowed
-    - 4am-6:59am: 1 allowed
-    - 7am-11:59am: 2 allowed
-    - noon-3:59pm: 3 allowed
-    - 4pm-6:59pm: 4 allowed
-    - 7pm+: 5 allowed (all slots open)
-
-    Returns:
-        Dict with slots_elapsed, entries_today, allowed, remaining, status, next_slot.
+    Dennis directive (Mar 28): No limit on daily journal entries.
+    Reports count for awareness but never returns BLOCKED.
+    See core/config.py for current JOURNAL_DAILY_LIMIT value.
     """
     config = get_config()
     posts_path = config.workspace_root / "projects" / "synthesis" / "data" / "posts.json"
@@ -106,32 +85,14 @@ def check_journal_cadence() -> Dict[str, Any]:
         ]
 
     count = len(entries_today)
-    allowed = _slots_elapsed_now()
-    remaining = max(0, allowed - count)
-    next_slot = _next_slot_pst()
     now_pst = datetime.now(PST)
 
-    blocked = count >= allowed
-
     return {
-        "status": "BLOCKED" if blocked else "OK",
+        "status": "OK",
         "entries_today": count,
         "titles": entries_today,
-        "slots_elapsed": allowed,
-        "allowed": allowed,
-        "remaining": remaining,
-        "next_slot": f"{next_slot}:00 PST" if next_slot else None,
         "current_time_pst": now_pst.strftime("%H:%M PST"),
-        "schedule": [f"{h}:00" for h in JOURNAL_PUBLISH_HOURS_PST],
-        "message": (
-            f"JOURNAL CADENCE: BLOCKED ({count}/{allowed} — "
-            f"{allowed} slot{'s' if allowed != 1 else ''} elapsed"
-            f"{f', next at {next_slot}:00 PST' if next_slot else ', all slots used'})"
-            if blocked
-            else f"JOURNAL CADENCE: OK ({count}/{allowed} — "
-            f"{remaining} remaining"
-            f"{f', next slot at {next_slot}:00 PST' if next_slot else ''})"
-        ),
+        "message": f"JOURNAL CADENCE: OK ({count} published today, no limit enforced)",
     }
 
 
@@ -250,7 +211,7 @@ class GateReport:
 
     @property
     def journal_blocked(self) -> bool:
-        return bool(self.journal_cadence and self.journal_cadence.get("status") == "BLOCKED")
+        return False  # Journal cadence is informational-only, never blocks
 
     @property
     def responder_blocked(self) -> bool:
@@ -302,20 +263,12 @@ class GateReport:
         lines.append(f"Claims found: {self.total_claims}")
         lines.append(f"Auto-verified: {self.auto_verified}")
 
-        # Journal cadence — always show (operational info for agents)
+        # Journal cadence — informational only, never blocked (Dennis directive, Mar 28)
         if self.journal_cadence:
             jc = self.journal_cadence
-            status_icon = "BLOCKED" if jc["status"] == "BLOCKED" else "OK"
-            lines.append(f"\n## Journal Cadence: {status_icon}")
-            lines.append(f"- {jc['entries_today']}/{jc['allowed']} entries "
-                         f"({jc['slots_elapsed']} slot{'s' if jc['slots_elapsed'] != 1 else ''} "
-                         f"elapsed at {jc['current_time_pst']})")
-            if jc.get("remaining", 0) > 0:
-                lines.append(f"- {jc['remaining']} remaining")
-            if jc.get("next_slot"):
-                lines.append(f"- Next slot: {jc['next_slot']}")
-            if jc["status"] == "BLOCKED":
-                lines.append("- **No more journal entries until next slot opens.**")
+            lines.append(f"\n## Journal Cadence: OK")
+            lines.append(f"- {jc['entries_today']} published today (no limit enforced)"
+                         f" at {jc['current_time_pst']}")
 
         # Responder cadence — always show
         if self.responder_cadence:
@@ -1278,11 +1231,9 @@ def quick_check(file_path: Optional[str] = None) -> str:
     jc = report.journal_cadence
     jc_suffix = ""
     if jc:
-        jc_suffix = f" | Journal: {jc['entries_today']}/{jc['allowed']}"
-        if jc["status"] == "BLOCKED":
-            jc_suffix += " BLOCKED"
+        jc_suffix = f" | Journal: {jc['entries_today']} today"
 
-    if report.clean and not report.journal_blocked:
+    if report.clean:
         return f"Gate: CLEAN ({report.total_claims} claims, {report.passed} verified){jc_suffix}"
 
     parts = []
@@ -1290,7 +1241,5 @@ def quick_check(file_path: Optional[str] = None) -> str:
         parts.append(f"{report.failed} FAILED")
     if report.stale_claims > 0:
         parts.append(f"{report.stale_claims} STALE")
-    if report.journal_blocked:
-        parts.append("JOURNAL BLOCKED")
 
     return f"Gate: {'|'.join(parts)} ({report.total_claims} claims, {report.passed} passed){jc_suffix}"

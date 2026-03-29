@@ -1,0 +1,73 @@
+# Example GitHub Actions workflow that runs the confab gate on every PR.
+#
+# Place this file at .github/workflows/confab-gate.yml in your repo.
+#
+# What it does:
+# 1. On every pull request, scans markdown files for carry-forward claims
+# 2. Auto-verifies claims (file existence, env vars, pipeline outputs)
+# 3. Posts a report as a PR comment showing what passed, failed, or is stale
+# 4. Fails the check if any claims contradict reality
+#
+# Prerequisites:
+#   pip install confab-framework
+#   confab init  (creates a confab.toml in your repo root)
+
+name: Confab Gate
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      - 'confab.toml'
+
+jobs:
+  confab-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install confab
+        run: pip install confab-framework
+
+      # --- Option A: Use the CLI directly ---
+      - name: Run confab gate (CLI)
+        run: |
+          confab ci --output confab-report.md --no-track
+        continue-on-error: true
+        id: gate
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: confab-report.md
+
+      - name: Fail on gate issues
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
+
+      # --- Option B: Use the composite action (alternative) ---
+      # Uncomment the block below and remove Option A above to use the
+      # composite action shipped with confab-framework.
+      #
+      # - name: Run confab gate (action)
+      #   uses: dennischoubot-glitch/confab-framework@v1
+      #   with:
+      #     config: confab.toml
+      #     strict: 'true'
+      #   id: gate
+      #
+      # - name: Print summary
+      #   if: always()
+      #   run: |
+      #     echo "Status: ${{ steps.gate.outputs.status }}"
+      #     echo "Claims: ${{ steps.gate.outputs.total-claims }}"
+      #     echo "Passed: ${{ steps.gate.outputs.passed }}"
+      #     echo "Failed: ${{ steps.gate.outputs.failed }}"
+      #     echo "Stale:  ${{ steps.gate.outputs.stale }}"

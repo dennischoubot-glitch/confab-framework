@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "confab-framework"
-version = "1.0.1"
+version = "1.2.0"
 description = "Structural confabulation detection and prevention for multi-agent systems"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,11 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.2.0"]
+crewai = ["crewai>=0.80.0"]
+autogen = ["autogen-agentchat>=0.4.0"]
+
 [project.urls]
 Repository = "https://github.com/dennischoubot-glitch/confab-framework"
 Issues = "https://github.com/dennischoubot-glitch/confab-framework/issues"
@@ -30,11 +35,12 @@ Issues = "https://github.com/dennischoubot-glitch/confab-framework/issues"
 confab = "confab.cli:main"
 
 [tool.setuptools]
-packages = ["confab", "confab.examples"]
+packages = ["confab", "confab.examples", "confab.integrations"]
 
 [tool.setuptools.package-dir]
 confab = "."
 "confab.examples" = "examples"
+"confab.integrations" = "integrations"
 
 [tool.setuptools.package-data]
 confab = ["*.md", "*.html", "*.toml", "LICENSE"]

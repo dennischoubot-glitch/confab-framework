@@ -196,8 +196,7 @@ class TestQuickCheck(unittest.TestCase):
     def tearDown(self):
         reset_config()
 
-    @patch("confab.gate._slots_elapsed_now", return_value=5)
-    def test_quick_check_clean(self, _mock_slots):
+    def test_quick_check_clean(self):
         result = quick_check()
         self.assertIn("CLEAN", result)
 

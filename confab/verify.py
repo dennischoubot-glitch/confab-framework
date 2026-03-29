@@ -971,7 +971,9 @@ def verify_count(claim: Claim) -> VerificationOutcome:
                 return _verify_regex_count(claim, root, now, source_cfg)
 
     # Built-in: test count (always available, no config needed)
-    if "test" in claim_lower:
+    # Must check for "N tests" pattern specifically, not just substring "test".
+    # Otherwise phrases like "90-day test" route here as a false positive.
+    if re.search(r'\b\d+\s+tests?\b', claim_lower):
         return _verify_test_count(claim, root, now)
 
     return VerificationOutcome(
