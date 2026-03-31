@@ -52,6 +52,11 @@ Usage:
     confab check-supports --json
     confab check-supports --slack
 
+    # Find zombie entries (ALL supports dead, using raw counts — no observation filter)
+    confab zombies
+    confab zombies --json
+    confab zombies --type idea
+
     # Scan knowledge tree for factual health (expired/perishable/unverified)
     confab tree
     confab tree --json
@@ -92,6 +97,16 @@ Usage:
     confab ci --strict               # exit 2 on stale claims
     confab ci --output report.md     # write markdown to file (for PR comments)
     confab ci --no-track             # don't persist to tracker DB
+
+    # Scan arbitrary markdown files for claims and verify
+    confab scan README.md docs/ARCHITECTURE.md
+    confab scan builder_priorities.md --json
+    confab scan path/to/file.md --no-verify  # extract only
+
+    # Fix expired observations (batch invalidate + Firewall check)
+    confab fix-expired              # invalidate all expired observations
+    confab fix-expired --dry-run    # preview without modifying
+    confab fix-expired --json       # JSON output
 
     # Full JSON output
     confab gate --json
@@ -211,6 +226,9 @@ def cmd_gate(args):
 def cmd_check(args):
     """Check inline text for claims and verify them."""
     text = args.text
+    if text == "-":
+        import sys
+        text = sys.stdin.read()
     claims = extract_claims(text, source_file="<cli>")
 
     if not claims:
@@ -270,6 +288,128 @@ def cmd_extract(args):
         if claim.extracted_env_vars:
             print(f"  env_vars: {', '.join(claim.extracted_env_vars)}")
         print()
+
+
+def _resolve_scan_paths(raw_paths):
+    """Resolve a mix of files and directories into individual .md file paths.
+
+    Directories are expanded recursively via **/*.md glob.  Files are
+    resolved relative to cwd first, then workspace_root.
+    """
+    resolved = []
+    for file_path in raw_paths:
+        path = Path(file_path)
+        if not path.is_absolute():
+            # Try cwd first (external use), then workspace root (ia use)
+            cwd_path = Path.cwd() / file_path
+            if cwd_path.exists():
+                path = cwd_path
+            else:
+                config = get_config()
+                path = config.workspace_root / file_path
+        if not path.exists():
+            print(f"Warning: {file_path} not found, skipping", file=sys.stderr)
+            continue
+        if path.is_dir():
+            md_files = sorted(path.rglob("*.md"))
+            if not md_files:
+                print(f"Warning: no .md files found in {file_path}", file=sys.stderr)
+            resolved.extend(md_files)
+        else:
+            resolved.append(path)
+    return resolved
+
+
+def cmd_scan(args):
+    """Scan arbitrary markdown files for verifiable claims.
+
+    Extracts claims using the ClaimExtractor pipeline and optionally verifies
+    each against the filesystem/environment. Works on any markdown file —
+    not limited to ia-specific priority files.
+
+    Accepts directories — they are expanded recursively to all .md files.
+    """
+    all_outcomes = []
+    all_claims = []
+    files_scanned = []
+
+    resolved_paths = _resolve_scan_paths(args.files)
+
+    for path in resolved_paths:
+        files_scanned.append(str(path))
+        claims = extract_claims_from_file(str(path))
+        all_claims.extend(claims)
+
+        if not args.no_verify:
+            outcomes = verify_all(claims)
+            all_outcomes.extend(outcomes)
+
+    if args.json:
+        if args.no_verify:
+            data = {
+                "files_scanned": files_scanned,
+                "total_claims": len(all_claims),
+                "claims": [c.to_dict() for c in all_claims],
+            }
+        else:
+            summary = summarize_outcomes(all_outcomes)
+            data = {
+                "files_scanned": files_scanned,
+                "total_claims": len(all_claims),
+                "summary": summary,
+                "outcomes": [o.to_dict() for o in all_outcomes],
+            }
+        print(json.dumps(data, indent=2))
+        return
+
+    # Human-readable output
+    if not all_claims:
+        print(f"No verifiable claims found in {len(files_scanned)} file(s).")
+        return
+
+    print(f"# Confab Scan: {len(files_scanned)} file(s), {len(all_claims)} claim(s)\n")
+
+    if args.no_verify:
+        for claim in all_claims:
+            vtag = f" {claim.verification_tag}" if claim.verification_tag else ""
+            print(f"  [{claim.claim_type.value}]{vtag} {claim.text[:120]}")
+            if claim.extracted_paths:
+                print(f"    paths: {', '.join(claim.extracted_paths)}")
+            if claim.extracted_env_vars:
+                print(f"    env: {', '.join(claim.extracted_env_vars)}")
+        return
+
+    passed = sum(1 for o in all_outcomes if o.result.value == "passed")
+    failed = sum(1 for o in all_outcomes if o.result.value == "failed")
+    inconclusive = sum(1 for o in all_outcomes if o.result.value == "inconclusive")
+    skipped = sum(1 for o in all_outcomes if o.result.value == "skipped")
+
+    print(f"Results: {passed} passed, {failed} failed, {inconclusive} inconclusive, {skipped} skipped\n")
+
+    for outcome in all_outcomes:
+        icon = {
+            "passed": "PASS",
+            "failed": "FAIL",
+            "inconclusive": "INCONCLUSIVE",
+            "skipped": "SKIP",
+        }.get(outcome.result.value, "?")
+
+        src = ""
+        if outcome.claim.source_file:
+            src = f" ({Path(outcome.claim.source_file).name}"
+            if outcome.claim.source_line:
+                src += f":{outcome.claim.source_line}"
+            src += ")"
+
+        print(f"  [{icon}] [{outcome.claim.claim_type.value}] {outcome.claim.text[:120]}{src}")
+        if outcome.result.value in ("failed", "passed", "inconclusive"):
+            for line in outcome.evidence.strip().split('\n'):
+                if line.strip():
+                    print(f"         {line.strip()}")
+        print()
+
+    if failed > 0:
+        sys.exit(1)
 
 
 def cmd_quick(args):
@@ -372,42 +512,72 @@ def cmd_prune(args):
 
 
 def cmd_report(args):
-    """Print a system health dashboard combining gate + supports + tree analysis."""
-    check_supports = _get_check_supports()
-    check_tree = _get_check_tree()
+    """Print a system health dashboard combining gate + supports + tree analysis.
+
+    When positional files/directories are provided, scans those specific paths
+    and produces a standalone health report. Tree/supports checks are attempted
+    but degrade gracefully when unavailable (typical for external users).
+
+    When no files are provided, falls back to config defaults (ia-specific behavior).
+    """
+    # Resolve files: positional args > --file flag > config defaults (None)
+    explicit_files = None
+    if args.files:
+        explicit_files = _resolve_scan_paths(args.files)
+        if not explicit_files:
+            print("No files found to scan.", file=sys.stderr)
+            sys.exit(1)
+        gate_files = [str(f) for f in explicit_files]
+    elif args.file:
+        gate_files = [args.file]
+    else:
+        gate_files = None  # run_gate will use config defaults
 
     # Run gate
-    files = [args.file] if args.file else None
-    gate_report = run_gate(files=files)
+    gate_report = run_gate(files=gate_files)
 
-    # Run supports check
+    # Run supports check (graceful when tree unavailable)
+    supports_report = None
+    supports_error = None
     try:
+        check_supports = _get_check_supports()
         supports_report = check_supports()
     except Exception as e:
-        supports_report = None
         supports_error = str(e)
 
-    # Run tree health check
+    # Run tree health check (graceful when tree unavailable)
+    tree_report = None
+    tree_error = None
     try:
+        check_tree = _get_check_tree()
         tree_report = check_tree()
     except Exception as e:
-        tree_report = None
         tree_error = str(e)
 
     if args.json:
         result = {
             "gate": gate_report.to_dict(),
-            "supports": supports_report.to_dict() if supports_report else {"error": supports_error},
-            "tree": tree_report.to_dict() if tree_report else {"error": tree_error},
         }
         if supports_report:
-            total = gate_report.total_claims + supports_report.checked_entries
-            verified = gate_report.passed + supports_report.healthy
-            result["coverage"] = {
-                "total_checked": total,
-                "verified_healthy": verified,
-                "percentage": round(verified / total * 100, 1) if total > 0 else 100.0,
-            }
+            result["supports"] = supports_report.to_dict()
+        elif supports_error:
+            result["supports"] = {"error": supports_error}
+        if tree_report:
+            result["tree"] = tree_report.to_dict()
+        elif tree_error:
+            result["tree"] = {"error": tree_error}
+
+        # Coverage calculation
+        total = gate_report.total_claims
+        verified = gate_report.passed
+        if supports_report:
+            total += supports_report.checked_entries
+            verified += supports_report.healthy
+        result["coverage"] = {
+            "total_checked": total,
+            "verified_healthy": verified,
+            "percentage": round(verified / total * 100, 1) if total > 0 else 100.0,
+        }
         print(json.dumps(result, indent=2))
         if gate_report.has_failures or (supports_report and supports_report.has_zombies):
             sys.exit(1)
@@ -440,7 +610,8 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
                  f"Failed: {gate_report.failed}  |  "
                  f"Stale: {gate_report.stale_claims}")
     lines.append(f"  Inconclusive: {gate_report.inconclusive}  |  "
-                 f"Skipped: {gate_report.skipped}")
+                 f"Skipped: {gate_report.skipped}"
+                 + (f"  |  Stale drift: {len(gate_report.stale_drift_details)}" if gate_report.has_stale_drift else ""))
 
     if gate_report.auto_verified > 0:
         claim_pct = gate_report.passed / gate_report.auto_verified * 100
@@ -469,6 +640,16 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
         if len(gate_report.failed_details) > 5:
             lines.append(f"    ...and {len(gate_report.failed_details) - 5} more")
 
+    if gate_report.has_stale_drift:
+        lines.append("")
+        lines.append(f"  STALE DRIFT ({len(gate_report.stale_drift_details)}):")
+        lines.append("  (Correct when written, source changed since)")
+        for d in gate_report.stale_drift_details[:3]:
+            lines.append(f"    ~> {d['claim_text'][:70]}")
+            lines.append(f"       Changed: {d.get('changed_file', '?')}")
+        if len(gate_report.stale_drift_details) > 3:
+            lines.append(f"    ...and {len(gate_report.stale_drift_details) - 3} more")
+
     if gate_report.has_stale:
         lines.append("")
         lines.append(f"  STALE ({gate_report.stale_claims}):")
@@ -477,6 +658,39 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
             lines.append(f"    ~  [{age} runs] {d['claim_text'][:70]}")
         if len(gate_report.stale_details) > 3:
             lines.append(f"    ...and {len(gate_report.stale_details) - 3} more")
+
+    # --- Per-file breakdown (shown when multiple files scanned) ---
+    if len(gate_report.files_scanned) > 1 and gate_report.all_outcomes:
+        lines.append("")
+        lines.append("-" * 52)
+        lines.append("")
+        lines.append("PER-FILE BREAKDOWN")
+
+        # Group outcomes by source file
+        by_file = {}
+        for outcome in gate_report.all_outcomes:
+            src = outcome.claim.source_file or "(unknown)"
+            # Use just the filename for display
+            try:
+                src = str(Path(src).name)
+            except Exception:
+                pass
+            by_file.setdefault(src, []).append(outcome)
+
+        # Sort by risk: most failures first, then most stale
+        def file_risk(item):
+            fname, outcomes = item
+            fails = sum(1 for o in outcomes if o.result.value == "failed")
+            stale = sum(1 for o in outcomes if o.result.value == "inconclusive")
+            return (-fails, -stale, fname)
+
+        for fname, outcomes in sorted(by_file.items(), key=file_risk):
+            total = len(outcomes)
+            passed = sum(1 for o in outcomes if o.result.value == "passed")
+            failed = sum(1 for o in outcomes if o.result.value == "failed")
+            status_icon = "x" if failed > 0 else ("~" if passed < total else "ok")
+            lines.append(f"  [{status_icon}] {fname}: {total} claims, "
+                         f"{passed} passed, {failed} failed")
 
     # --- Supports section ---
     lines.append("")
@@ -564,14 +778,35 @@ def _format_health_dashboard(gate_report, supports_report, tree_report=None):
     if tree_report:
         lines.append(f"  Tree TTL coverage: {tree_report.ttl_coverage:.1f}%")
 
-    # --- Overall status ---
-    lines.append("")
-    lines.append("=" * 52)
-
+    # --- Recommended actions ---
     has_critical = gate_report.has_failures or (supports_report and supports_report.has_zombies)
     has_warning = (gate_report.has_stale
                    or (supports_report and supports_report.has_issues and not supports_report.has_zombies)
                    or (tree_report and tree_report.has_expired))
+
+    actions = []
+    if gate_report.has_failures:
+        actions.append(f"Fix {gate_report.failed} failed claim(s): verify file paths and env vars exist")
+    if gate_report.has_stale:
+        actions.append(f"Re-verify {gate_report.stale_claims} stale claim(s) or add [v1]/[v2] tags")
+    if gate_report.has_stale_drift:
+        actions.append(f"Update {len(gate_report.stale_drift_details)} drifted claim(s) to match current source")
+    if supports_report and supports_report.has_zombies:
+        actions.append(f"Run `confab check-supports --fix` to clean {len(supports_report.zombies)} zombie(s)")
+    if tree_report and tree_report.has_expired:
+        actions.append(f"Run `confab fix-expired` to clean {len(tree_report.expired)} expired observation(s)")
+
+    if actions:
+        lines.append("")
+        lines.append("-" * 52)
+        lines.append("")
+        lines.append("RECOMMENDED ACTIONS")
+        for i, action in enumerate(actions, 1):
+            lines.append(f"  {i}. {action}")
+
+    # --- Overall status ---
+    lines.append("")
+    lines.append("=" * 52)
 
     if has_critical:
         status = "CRITICAL"
@@ -597,6 +832,8 @@ def _format_health_slack(gate_report, supports_report, tree_report=None):
         parts = []
         if gate_report.failed > 0:
             parts.append(f":x: {gate_report.failed} failed")
+        if gate_report.has_stale_drift:
+            parts.append(f":arrows_counterclockwise: {len(gate_report.stale_drift_details)} drift")
         if gate_report.stale_claims > 0:
             parts.append(f":hourglass: {gate_report.stale_claims} stale")
         if gate_report.passed > 0:
@@ -798,7 +1035,8 @@ Examples:
 
     # report
     report_parser = subparsers.add_parser("report", help="System health dashboard (gate + supports + coverage)")
-    report_parser.add_argument("--file", "-f", help="Specific file to scan")
+    report_parser.add_argument("files", nargs="*", help="Markdown files or directories to scan (directories expanded to *.md). If omitted, uses config defaults.")
+    report_parser.add_argument("--file", "-f", help="Specific file to scan (legacy, prefer positional args)")
     report_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     report_parser.add_argument("--slack", action="store_true", help="Concise Slack-friendly output")
 
@@ -901,6 +1139,35 @@ Examples:
                                default="all", help="Which data source to triage (default: all)")
     triage_parser.add_argument("--category", help="Filter to specific category (e.g. tree_no_ttl, gate_stale)")
 
+    # zombies — find ideas/principles with all supports dead (raw counts, no observation filter)
+    zombies_parser = subparsers.add_parser(
+        "zombies",
+        help="Find entries where ALL supports are invalidated (uses raw counts, catches observation-only deaths)",
+    )
+    zombies_parser.add_argument("--tree", "-t", help="Path to KNOWLEDGE_TREE.json (default: auto-detect)")
+    zombies_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    zombies_parser.add_argument("--type", choices=["idea", "principle", "truth", "all"], default="all",
+                                help="Filter by entry type (default: all)")
+
+    # fix-expired — batch invalidate expired observations
+    fix_expired_parser = subparsers.add_parser(
+        "fix-expired",
+        help="Invalidate expired observations and check for Firewall violations (idea-489)",
+    )
+    fix_expired_parser.add_argument("--tree", "-t", help="Path to KNOWLEDGE_TREE.json (default: auto-detect)")
+    fix_expired_parser.add_argument("--dry-run", action="store_true", help="Preview without modifying the tree")
+    fix_expired_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+
+    # scan — scan arbitrary markdown files for claims and verify
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="Scan arbitrary markdown files for verifiable claims (extract + verify)",
+    )
+    scan_parser.add_argument("files", nargs="+", help="Markdown files or directories to scan (directories are expanded recursively to *.md)")
+    scan_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    scan_parser.add_argument("--no-verify", action="store_true",
+                             help="Extract claims only, skip verification")
+
     # init — generate a starter confab.toml
     init_parser = subparsers.add_parser("init", help="Generate a starter confab.toml in the current directory")
 
@@ -948,6 +1215,12 @@ Examples:
         cmd_quarantine(args)
     elif args.command == "triage":
         cmd_triage(args)
+    elif args.command == "zombies":
+        cmd_zombies(args)
+    elif args.command == "fix-expired":
+        cmd_fix_expired(args)
+    elif args.command == "scan":
+        cmd_scan(args)
     elif args.command == "init":
         cmd_init(args)
     else:
@@ -1645,6 +1918,93 @@ def cmd_check_supports(args):
         sys.exit(1)
 
 
+def cmd_zombies(args):
+    """Find entries where ALL supports are invalidated, using raw counts.
+
+    Unlike check-supports (which filters out dead observation supports for ideas),
+    this command uses raw support counts to catch ideas standing entirely on rubble —
+    even when all their supports are observations. Addresses idea-489 (The Firewall).
+    """
+    tree_path = args.tree
+    if not tree_path:
+        candidates = [
+            Path("core/knowledge/KNOWLEDGE_TREE.json"),
+            Path(__file__).parent.parent / "knowledge" / "KNOWLEDGE_TREE.json",
+        ]
+        for c in candidates:
+            if c.exists():
+                tree_path = str(c)
+                break
+    if not tree_path:
+        print("Error: could not find KNOWLEDGE_TREE.json. Use --tree to specify.")
+        sys.exit(1)
+
+    with open(tree_path) as f:
+        tree = json.load(f)
+
+    nodes = tree.get("nodes", {})
+    invalidated_ids = {nid for nid, n in nodes.items() if n.get("invalidated")}
+    all_node_ids = set(nodes.keys())
+
+    supported_types = {"idea", "principle", "truth"}
+    type_filter = args.type if args.type != "all" else None
+
+    zombies = []
+    for entry_id, entry in nodes.items():
+        if entry.get("invalidated"):
+            continue
+        entry_type = entry.get("type", "")
+        if entry_type not in supported_types:
+            continue
+        if type_filter and entry_type != type_filter:
+            continue
+
+        supports = entry.get("supports", [])
+        if not supports:
+            continue
+
+        dead = [s for s in supports if s in invalidated_ids or s not in all_node_ids]
+        if len(dead) == len(supports):
+            zombies.append({
+                "id": entry_id,
+                "type": entry_type,
+                "domain": entry.get("domain", "unset") or "unset",
+                "content": entry.get("content", "")[:120],
+                "total_supports": len(supports),
+                "dead_ids": dead,
+            })
+
+    zombies.sort(key=lambda z: (z["type"], z["id"]))
+
+    if args.json:
+        print(json.dumps({"zombies": zombies, "count": len(zombies)}, indent=2))
+        return
+
+    if not zombies:
+        print("No zombie entries found. All supported entries have at least one living support.")
+        return
+
+    print(f"# Zombie Entries ({len(zombies)} found)\n")
+    print("Entries where 100% of supports are invalidated or missing (raw counts).\n")
+
+    by_type = {}
+    for z in zombies:
+        by_type.setdefault(z["type"], []).append(z)
+
+    for entry_type in ["idea", "principle", "truth"]:
+        entries = by_type.get(entry_type, [])
+        if not entries:
+            continue
+        print(f"## {entry_type.title()}s ({len(entries)})\n")
+        for z in entries:
+            dead_str = ", ".join(z["dead_ids"])
+            print(f"**{z['id']}** ({z['domain']}) — {z['total_supports']} dead supports")
+            print(f"  {z['content']}")
+            print(f"  Dead: {dead_str}\n")
+
+    sys.exit(1)
+
+
 def cmd_tree(args):
     """Scan knowledge tree for factual health issues (expired, perishable, unverified)."""
     check_tree = _get_check_tree()
@@ -1857,6 +2217,29 @@ def cmd_audit(args):
     lines.append("=" * 56)
 
     print("\n".join(lines))
+
+
+def cmd_fix_expired(args):
+    """Invalidate expired observations and check for Firewall violations."""
+    try:
+        from .fix_expired import fix_expired
+    except ImportError:
+        from confab.fix_expired import fix_expired
+
+    result = fix_expired(
+        tree_path=getattr(args, 'tree', None),
+        dry_run=getattr(args, 'dry_run', False),
+    )
+
+    if getattr(args, 'json', False):
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(result.format_report())
+
+    if result.expired_count > 0 and not result.dry_run:
+        sys.exit(0)
+    elif result.expired_count > 0 and result.dry_run:
+        sys.exit(1)  # Signal there's work to do
 
 
 def cmd_init(args):

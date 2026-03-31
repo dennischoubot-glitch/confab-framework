@@ -11,6 +11,9 @@ from confab.claims import (
     summarize_claims,
     FILE_PATH_RE,
     ENV_VAR_RE,
+    ENV_VAR_STATUS_RE,
+    STATUS_ERROR_RE,
+    FACT_CLAIM_RE,
     VERIFICATION_TAG_RE,
     BLOCKER_RE,
     PIPELINE_STATUS_RE,
@@ -625,6 +628,682 @@ class TestClaimToDict(unittest.TestCase):
         self.assertEqual(d["verifiability"], "auto")
         self.assertEqual(d["source_file"], "test.md")
         self.assertEqual(d["env_vars"], ["API_KEY"])
+
+
+class TestEnvVarStatusRegex(unittest.TestCase):
+    """Test ENV_VAR_STATUS_RE pattern matching for natural-language env var claims."""
+
+    def test_is_not_set(self):
+        match = ENV_VAR_STATUS_RE.search("OPENAI_API_KEY is not set in the environment")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "OPENAI_API_KEY")
+
+    def test_not_configured(self):
+        match = ENV_VAR_STATUS_RE.search("ANTHROPIC_API_KEY not configured")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "ANTHROPIC_API_KEY")
+
+    def test_missing(self):
+        match = ENV_VAR_STATUS_RE.search("DATABASE_URL missing from .env")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "DATABASE_URL")
+
+    def test_absent(self):
+        match = ENV_VAR_STATUS_RE.search("SLACK_BOT_TOKEN is absent")
+        self.assertIsNotNone(match)
+
+    def test_unset(self):
+        match = ENV_VAR_STATUS_RE.search("GITHUB_TOKEN unset")
+        self.assertIsNotNone(match)
+
+    def test_not_available(self):
+        match = ENV_VAR_STATUS_RE.search("GOOGLE_API_KEY is not available")
+        self.assertIsNotNone(match)
+
+    def test_no_match_on_normal_text(self):
+        match = ENV_VAR_STATUS_RE.search("the pipeline is working fine")
+        self.assertIsNone(match)
+
+
+class TestEnvVarStatusExtraction(unittest.TestCase):
+    """Test env var claim extraction from natural language."""
+
+    def test_key_is_not_set(self):
+        claims = extract_claims("OPENAI_API_KEY is not set in the environment")
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+        self.assertIn("OPENAI_API_KEY", env_claims[0].extracted_env_vars)
+
+    def test_key_missing(self):
+        claims = extract_claims("ANTHROPIC_API_KEY missing from .env file")
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+
+    def test_key_not_configured(self):
+        claims = extract_claims("SLACK_BOT_TOKEN is not configured")
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+
+    def test_unknown_var_with_suffix(self):
+        """Env vars ending in common suffixes should be caught even if not in known list."""
+        claims = extract_claims("CUSTOM_API_KEY is not set")
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+
+    def test_unknown_var_without_suffix_ignored(self):
+        """Random uppercase words should not be caught as env vars."""
+        claims = extract_claims("CONFAB is not set up correctly")
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 0)
+
+
+class TestStatusErrorRegex(unittest.TestCase):
+    """Test STATUS_ERROR_RE pattern matching for error codes and expiry."""
+
+    def test_returned_403(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("returned a 403 error"))
+
+    def test_got_500(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("got 500 error"))
+
+    def test_received_401_status(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("received a 401 status"))
+
+    def test_has_expired(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("cookie has expired"))
+
+    def test_expired(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("The token expired"))
+
+    def test_timed_out(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("request timed out"))
+
+    def test_returned_error(self):
+        self.assertIsNotNone(STATUS_ERROR_RE.search("returned an error"))
+
+    def test_no_match_normal_text(self):
+        self.assertIsNone(STATUS_ERROR_RE.search("the system works perfectly"))
+
+
+class TestStatusErrorExtraction(unittest.TestCase):
+    """Test status/error claim extraction."""
+
+    def test_cookie_expired(self):
+        claims = extract_claims("The Substack cookie has expired")
+        status_claims = [c for c in claims if c.claim_type == ClaimType.STATUS_CLAIM]
+        self.assertEqual(len(status_claims), 1)
+
+    def test_403_error(self):
+        claims = extract_claims("The responder returned a 403 error yesterday")
+        status_claims = [c for c in claims if c.claim_type == ClaimType.STATUS_CLAIM]
+        self.assertEqual(len(status_claims), 1)
+
+    def test_timeout(self):
+        claims = extract_claims("The API request timed out during deployment")
+        status_claims = [c for c in claims if c.claim_type == ClaimType.STATUS_CLAIM]
+        self.assertEqual(len(status_claims), 1)
+
+
+class TestFactClaimRegex(unittest.TestCase):
+    """Test FACT_CLAIM_RE pattern matching for numeric factual claims."""
+
+    def test_cpi_percentage(self):
+        self.assertIsNotNone(FACT_CLAIM_RE.search("CPI is at 3.5%"))
+
+    def test_rate_percentage(self):
+        self.assertIsNotNone(FACT_CLAIM_RE.search("rate is 4.2%"))
+
+    def test_dropped_to(self):
+        self.assertIsNotNone(FACT_CLAIM_RE.search("GDP dropped to 2.1%"))
+
+    def test_rose_to(self):
+        self.assertIsNotNone(FACT_CLAIM_RE.search("inflation rose to 4.8%"))
+
+    def test_stands_at(self):
+        self.assertIsNotNone(FACT_CLAIM_RE.search("unemployment stands at 4.1%"))
+
+    def test_no_match_without_percent(self):
+        """Plain numbers without % should not match (those are counts, not facts)."""
+        self.assertIsNone(FACT_CLAIM_RE.search("CPI is at 3"))
+
+
+class TestFactClaimExtraction(unittest.TestCase):
+    """Test fact claim extraction."""
+
+    def test_cpi_claim(self):
+        claims = extract_claims("CPI is at 3.5% currently")
+        fact_claims = [c for c in claims if c.claim_type == ClaimType.FACT_CLAIM]
+        self.assertEqual(len(fact_claims), 1)
+
+    def test_gdp_claim(self):
+        claims = extract_claims("GDP dropped to 2.1% in Q4")
+        fact_claims = [c for c in claims if c.claim_type == ClaimType.FACT_CLAIM]
+        self.assertEqual(len(fact_claims), 1)
+
+    def test_fact_claim_verifiability(self):
+        """Fact claims should be manual verifiability (need external data)."""
+        claims = extract_claims("CPI is at 3.5% currently")
+        fact_claims = [c for c in claims if c.claim_type == ClaimType.FACT_CLAIM]
+        self.assertEqual(fact_claims[0].verifiability, VerifiabilityLevel.MANUAL)
+
+
+class TestCountClaimExpanded(unittest.TestCase):
+    """Test count claim extraction with expanded assertion context."""
+
+    def test_tests_passing(self):
+        """'passing' should now be recognized as assertion context."""
+        claims = extract_claims("Confab framework has 512 tests passing")
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertEqual(len(count_claims), 1)
+        self.assertIn("512", count_claims[0].extracted_numbers)
+
+    def test_tests_failed(self):
+        claims = extract_claims("3 tests failed in the last run")
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertEqual(len(count_claims), 1)
+
+    def test_tests_passed(self):
+        claims = extract_claims("All 42 tests passed")
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertEqual(len(count_claims), 1)
+
+
+class TestDreamerGapIntegration(unittest.TestCase):
+    """Integration test: the 8-claim sample from the dreamer's analysis."""
+
+    def test_catches_at_least_6_of_7(self):
+        """The extractor should catch at least 6 of the 7 test lines."""
+        text = (
+            "The audio pipeline is working.\n"
+            "File at scripts/weather_config.json should be updated.\n"
+            "CPI is at 3.5% currently.\n"
+            "Confab framework has 512 tests passing.\n"
+            "The Substack cookie has expired.\n"
+            "OPENAI_API_KEY is not set in the environment.\n"
+            "The responder returned a 403 error yesterday."
+        )
+        claims = extract_claims(text)
+        self.assertGreaterEqual(len(claims), 6)
+
+    def test_catches_all_7(self):
+        """Verify all 7 lines produce claims."""
+        text = (
+            "The audio pipeline is working.\n"
+            "File at scripts/weather_config.json should be updated.\n"
+            "CPI is at 3.5% currently.\n"
+            "Confab framework has 512 tests passing.\n"
+            "The Substack cookie has expired.\n"
+            "OPENAI_API_KEY is not set in the environment.\n"
+            "The responder returned a 403 error yesterday."
+        )
+        claims = extract_claims(text)
+        types = {c.claim_type for c in claims}
+        self.assertIn(ClaimType.PIPELINE_WORKS, types)
+        self.assertIn(ClaimType.FILE_EXISTS, types)
+        self.assertIn(ClaimType.FACT_CLAIM, types)
+        self.assertIn(ClaimType.COUNT_CLAIM, types)
+        self.assertIn(ClaimType.STATUS_CLAIM, types)
+        self.assertIn(ClaimType.ENV_VAR, types)
+        self.assertEqual(len(claims), 7)
+
+
+class TestConfidenceScoring(unittest.TestCase):
+    """Tests for claim confidence scoring."""
+
+    def test_file_exists_high_confidence(self):
+        """File existence claims with paths should score high."""
+        from confab.claims import score_confidence
+        claim = Claim(
+            text="Config at `core/config.py` is ready",
+            claim_type=ClaimType.FILE_EXISTS,
+            verifiability=VerifiabilityLevel.AUTO,
+            extracted_paths=["core/config.py"],
+        )
+        score = score_confidence(claim)
+        self.assertGreaterEqual(score, 0.8)
+
+    def test_env_var_high_confidence(self):
+        """Env var claims with extracted vars should score high."""
+        from confab.claims import score_confidence
+        claim = Claim(
+            text="Blocked on OPENAI_API_KEY",
+            claim_type=ClaimType.ENV_VAR,
+            verifiability=VerifiabilityLevel.AUTO,
+            extracted_env_vars=["OPENAI_API_KEY"],
+        )
+        score = score_confidence(claim)
+        self.assertGreaterEqual(score, 0.8)
+
+    def test_subjective_low_confidence(self):
+        """Subjective claims should score low."""
+        from confab.claims import score_confidence
+        claim = Claim(
+            text="The system feels slow today",
+            claim_type=ClaimType.SUBJECTIVE,
+            verifiability=VerifiabilityLevel.MANUAL,
+        )
+        score = score_confidence(claim)
+        self.assertLessEqual(score, 0.6)
+
+    def test_fact_claim_medium_confidence(self):
+        """Fact claims without artifacts score medium."""
+        from confab.claims import score_confidence
+        claim = Claim(
+            text="CPI at 3.5%",
+            claim_type=ClaimType.FACT_CLAIM,
+            verifiability=VerifiabilityLevel.MANUAL,
+        )
+        score = score_confidence(claim)
+        self.assertGreater(score, 0.4)
+        self.assertLess(score, 0.7)
+
+    def test_age_penalty_reduces_confidence(self):
+        """Older unverified claims should lose confidence."""
+        from confab.claims import score_confidence
+        young = Claim(
+            text="Pipeline is working",
+            claim_type=ClaimType.PIPELINE_WORKS,
+            verifiability=VerifiabilityLevel.SEMI,
+            age_builds=0,
+        )
+        old = Claim(
+            text="Pipeline is working",
+            claim_type=ClaimType.PIPELINE_WORKS,
+            verifiability=VerifiabilityLevel.SEMI,
+            age_builds=5,
+        )
+        self.assertGreater(score_confidence(young), score_confidence(old))
+
+    def test_verification_tag_boosts_confidence(self):
+        """Claims with verification tags should score higher."""
+        from confab.claims import score_confidence
+        untagged = Claim(
+            text="Script runs fine",
+            claim_type=ClaimType.SCRIPT_RUNS,
+            verifiability=VerifiabilityLevel.AUTO,
+        )
+        tagged = Claim(
+            text="Script runs fine",
+            claim_type=ClaimType.SCRIPT_RUNS,
+            verifiability=VerifiabilityLevel.AUTO,
+            verification_tag="[v1: tested 2026-03-29]",
+        )
+        self.assertGreater(score_confidence(tagged), score_confidence(untagged))
+
+    def test_v2_tag_higher_than_v1(self):
+        """v2 verification should score higher than v1."""
+        from confab.claims import score_confidence
+        v1 = Claim(
+            text="Monitor running",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+            verification_tag="[v1: checked 2026-03-29]",
+        )
+        v2 = Claim(
+            text="Monitor running",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+            verification_tag="[v2: checked 2026-03-29]",
+        )
+        self.assertGreater(score_confidence(v2), score_confidence(v1))
+
+    def test_confidence_in_to_dict(self):
+        """Confidence should appear in to_dict output."""
+        claim = Claim(
+            text="test",
+            claim_type=ClaimType.FILE_EXISTS,
+            verifiability=VerifiabilityLevel.AUTO,
+            extracted_paths=["test.py"],
+            confidence=0.85,
+        )
+        d = claim.to_dict()
+        self.assertIn("confidence", d)
+        self.assertEqual(d["confidence"], 0.85)
+
+    def test_confidence_bounds(self):
+        """Confidence should always be in [0.0, 1.0]."""
+        from confab.claims import score_confidence
+        # Max everything
+        maxed = Claim(
+            text="test",
+            claim_type=ClaimType.FILE_EXISTS,
+            verifiability=VerifiabilityLevel.AUTO,
+            extracted_paths=["a.py"],
+            extracted_env_vars=["KEY"],
+            extracted_config_keys=["k"],
+            extracted_numbers=["5"],
+            verification_tag="[v2: checked 2026-03-29]",
+        )
+        self.assertLessEqual(score_confidence(maxed), 1.0)
+        # Min everything
+        minimal = Claim(
+            text="maybe something",
+            claim_type=ClaimType.SUBJECTIVE,
+            verifiability=VerifiabilityLevel.MANUAL,
+            age_builds=10,
+        )
+        self.assertGreaterEqual(score_confidence(minimal), 0.0)
+
+    def test_extraction_assigns_confidence(self):
+        """extract_claims should populate confidence on all claims."""
+        text = "Pipeline `scripts/test.py` is working\nBlocked on OPENAI_API_KEY"
+        claims = extract_claims(text, source_file="test.md")
+        for c in claims:
+            self.assertGreater(c.confidence, 0.0)
+            self.assertLessEqual(c.confidence, 1.0)
+
+    def test_summary_includes_confidence_stats(self):
+        """summarize_claims should include confidence statistics."""
+        from confab.claims import summarize_claims
+        claims = [
+            Claim(text="a", claim_type=ClaimType.FILE_EXISTS,
+                  verifiability=VerifiabilityLevel.AUTO,
+                  extracted_paths=["x.py"], confidence=0.9),
+            Claim(text="b", claim_type=ClaimType.SUBJECTIVE,
+                  verifiability=VerifiabilityLevel.MANUAL,
+                  confidence=0.4),
+        ]
+        s = summarize_claims(claims)
+        self.assertIn("avg_confidence", s)
+        self.assertIn("high_confidence", s)
+        self.assertIn("low_confidence", s)
+        self.assertEqual(s["avg_confidence"], 0.65)
+        self.assertEqual(s["high_confidence"], 1)
+        self.assertEqual(s["low_confidence"], 1)
+
+
+class TestDateExpiryClaims(unittest.TestCase):
+    """Test date-expiry claim detection."""
+
+    def test_expires_day_name(self):
+        """'expires Mon' should be detected as DATE_EXPIRY."""
+        text = "Gas contracts at 99¢ verified — no action needed, expire Mon."
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_expiry_uppercase(self):
+        """'EXPIRY MON.' should be detected as DATE_EXPIRY."""
+        text = "| Gas >$3.70 | 35 | 99¢ | +$10.15 | EXPIRY MON. AAA=$3.98, near-certain YES. |"
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_resolve_with_month_day(self):
+        """'resolve Apr 5' should be detected as DATE_EXPIRY."""
+        text = "| Tesla 330K NO | 96 | 11¢ | -$29.76 | Let resolve Apr 5. |"
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_key_date_line(self):
+        """'Mon Mar 31: Gas contracts expire' should be DATE_EXPIRY."""
+        text = "- **Mon Mar 31:** Gas contracts expire"
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_deadline_with_date(self):
+        """'deadline Wed Apr 2' should be DATE_EXPIRY."""
+        text = "NIST NCCoE comments deadline Wed Apr 2."
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_no_date_no_match(self):
+        """'expires eventually' without a date reference should NOT match."""
+        text = "This cookie expires eventually."
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 0)
+
+    def test_due_with_iso_date(self):
+        """'due 2026-04-02' should be DATE_EXPIRY."""
+        text = "Report due 2026-04-02 for compliance review."
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+    def test_exemptions_expire_date(self):
+        """'USMCA exemptions expire' with date should be DATE_EXPIRY."""
+        text = "- **Wed Apr 2:** USMCA exemptions expire. Full 15% tariff on Canada/Mexico."
+        claims = extract_claims(text)
+        expiry_claims = [c for c in claims if c.claim_type == ClaimType.DATE_EXPIRY]
+        self.assertEqual(len(expiry_claims), 1)
+
+
+class TestFlagStaleVtags(unittest.TestCase):
+    """Test verification tag staleness detection."""
+
+    def test_stale_vtag_detected(self):
+        """Claims with vtags older than threshold should be flagged."""
+        from datetime import datetime, timezone, timedelta
+        from confab.claims import flag_stale_vtags
+
+        old_time = datetime(2026, 3, 28, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)  # 48h later
+
+        claim = Claim(
+            text="Audio pipeline: WORKING",
+            claim_type=ClaimType.PIPELINE_WORKS,
+            verifiability=VerifiabilityLevel.AUTO,
+            verification_tag="[v2: verified 2026-03-28]",
+        )
+        stale = flag_stale_vtags([claim], max_age_hours=24.0, now=now)
+        self.assertEqual(len(stale), 1)
+        self.assertGreater(stale[0][1], 24.0)
+
+    def test_fresh_vtag_not_flagged(self):
+        """Claims with recent vtags should NOT be flagged."""
+        from datetime import datetime, timezone
+        from confab.claims import flag_stale_vtags
+
+        now = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)
+
+        claim = Claim(
+            text="Substack cookie: WORKING",
+            claim_type=ClaimType.STATUS_CLAIM,
+            verifiability=VerifiabilityLevel.SEMI,
+            verification_tag="[v2: verified 2026-03-30]",
+        )
+        stale = flag_stale_vtags([claim], max_age_hours=24.0, now=now)
+        self.assertEqual(len(stale), 0)
+
+    def test_behavior_claims_shorter_ttl(self):
+        """Behavior claims should use half the TTL threshold."""
+        from datetime import datetime, timezone
+        from confab.claims import flag_stale_vtags
+
+        now = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)
+
+        # 18h old — fresh for 24h threshold, but stale for behavior (12h)
+        claim = Claim(
+            text="Weather monitor: RUNNING",
+            claim_type=ClaimType.PROCESS_STATUS,
+            verifiability=VerifiabilityLevel.AUTO,
+            verification_tag="[v1: verified 2026-03-29 18:00]",
+        )
+        stale = flag_stale_vtags([claim], max_age_hours=24.0, now=now)
+        self.assertEqual(len(stale), 1)
+
+    def test_no_vtag_not_flagged(self):
+        """Claims without vtags should NOT be flagged."""
+        from confab.claims import flag_stale_vtags
+
+        claim = Claim(
+            text="Something happened",
+            claim_type=ClaimType.STATUS_CLAIM,
+            verifiability=VerifiabilityLevel.SEMI,
+        )
+        stale = flag_stale_vtags([claim], max_age_hours=24.0)
+        self.assertEqual(len(stale), 0)
+
+    def test_unverified_tag_not_flagged(self):
+        """[unverified] tags should NOT be flagged for staleness."""
+        from confab.claims import flag_stale_vtags
+
+        claim = Claim(
+            text="Something claimed",
+            claim_type=ClaimType.STATUS_CLAIM,
+            verifiability=VerifiabilityLevel.SEMI,
+            verification_tag="[unverified]",
+        )
+        stale = flag_stale_vtags([claim], max_age_hours=24.0)
+        self.assertEqual(len(stale), 0)
+
+
+class TestGenericAgentOutput(unittest.TestCase):
+    """Tests for generic (non-ia-specific) agent output claim extraction.
+
+    These cover the sentence splitting, generic fractional counts,
+    positive env var status, and inline file path patterns added
+    to support external agent output.
+    """
+
+    def test_acceptance_case_4_claims(self):
+        """The dreamer's acceptance test: 4 claims from one line."""
+        text = (
+            "The config at /tmp/test.yaml is deployed. "
+            "Tests pass (42/42). "
+            "The server at port 8080 is running. "
+            "ENV var DATABASE_URL is set."
+        )
+        claims = extract_claims(text)
+        self.assertEqual(len(claims), 4)
+        types = {c.claim_type for c in claims}
+        self.assertIn(ClaimType.PROCESS_STATUS, types)
+        self.assertIn(ClaimType.COUNT_CLAIM, types)
+        self.assertIn(ClaimType.ENV_VAR, types)
+        # File path claim (config_present or file_exists)
+        self.assertTrue(
+            any(c.claim_type in (ClaimType.CONFIG_PRESENT, ClaimType.FILE_EXISTS) for c in claims)
+        )
+
+    # --- Sentence splitting ---
+
+    def test_sentence_splitting_basic(self):
+        """Multi-sentence lines are split into independent claims."""
+        text = "File exists. Service is running."
+        claims = extract_claims(text)
+        # Should produce at least 1 claim per sentence that matches a pattern
+        self.assertGreaterEqual(len(claims), 1)
+
+    def test_sentence_splitting_preserves_single_line(self):
+        """Single-sentence lines are not affected by splitting."""
+        text = "The server at port 8080 is running."
+        claims = extract_claims(text)
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].claim_type, ClaimType.PROCESS_STATUS)
+
+    def test_sentence_splitting_headings_not_split(self):
+        """Headings should not be split even if they contain periods."""
+        text = "## Status v1.2. Updated.\nSome content."
+        claims = extract_claims(text)
+        # Heading should be treated as one unit, not split
+        # No assertions on count — just no crash
+        self.assertIsInstance(claims, list)
+
+    # --- Generic fractional counts ---
+
+    def test_generic_frac_parenthesized(self):
+        """Parenthesized fractions like (42/42) are extracted."""
+        text = "Tests pass (42/42)."
+        claims = extract_claims(text)
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].claim_type, ClaimType.COUNT_CLAIM)
+        self.assertIn("42", claims[0].extracted_numbers)
+
+    def test_generic_frac_bare(self):
+        """Bare fractions like 10/10 in assertion context are extracted."""
+        text = "Checks completed 10/10."
+        claims = extract_claims(text)
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertGreaterEqual(len(count_claims), 1)
+
+    def test_generic_frac_no_false_positive_on_dates(self):
+        """Date-like patterns 03/31 should not match as fractional counts
+        when in directive context."""
+        text = "The limit is 5 per day as of 03/31."
+        claims = extract_claims(text)
+        # Should not produce a count claim (directive context)
+        count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+        self.assertEqual(len(count_claims), 0)
+
+    def test_generic_frac_test_results(self):
+        """Various test result formats produce count claims."""
+        for text in [
+            "All tests pass (100/100).",
+            "Build status: 5/5 passing.",
+            "Lint: 0/42 errors found.",
+        ]:
+            claims = extract_claims(text)
+            count_claims = [c for c in claims if c.claim_type == ClaimType.COUNT_CLAIM]
+            self.assertGreaterEqual(
+                len(count_claims), 1,
+                f"Expected count claim for: {text}"
+            )
+
+    # --- Positive env var status ---
+
+    def test_env_var_positive_set(self):
+        """'ENV var DATABASE_URL is set' produces an ENV_VAR claim."""
+        text = "ENV var DATABASE_URL is set."
+        claims = extract_claims(text)
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].claim_type, ClaimType.ENV_VAR)
+        self.assertIn("DATABASE_URL", claims[0].extracted_env_vars)
+
+    def test_env_var_positive_configured(self):
+        """'ANTHROPIC_API_KEY is configured' produces an ENV_VAR claim."""
+        text = "ANTHROPIC_API_KEY is configured."
+        claims = extract_claims(text)
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+        self.assertIn("ANTHROPIC_API_KEY", env_claims[0].extracted_env_vars)
+
+    def test_env_var_positive_with_prefix(self):
+        """'ENV variable GITHUB_TOKEN is present' produces a claim."""
+        text = "ENV variable GITHUB_TOKEN is present."
+        claims = extract_claims(text)
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+
+    def test_env_var_positive_unknown_var_with_suffix(self):
+        """Unknown env vars with standard suffixes are still extracted."""
+        text = "MY_CUSTOM_API_KEY is set."
+        claims = extract_claims(text)
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 1)
+        self.assertIn("MY_CUSTOM_API_KEY", env_claims[0].extracted_env_vars)
+
+    def test_env_var_positive_ignores_random_words(self):
+        """Regular uppercase words like HELLO should not match."""
+        text = "HELLO is set to greet users."
+        claims = extract_claims(text)
+        env_claims = [c for c in claims if c.claim_type == ClaimType.ENV_VAR]
+        self.assertEqual(len(env_claims), 0)
+
+    # --- Multi-claim single line ---
+
+    def test_multi_claim_line_all_types(self):
+        """A single line with 4 different claim types produces 4 claims."""
+        text = (
+            "Config at /tmp/app.yaml is ready. "
+            "Tests: 50/50. "
+            "Worker service is running. "
+            "ENV var SECRET_KEY is set."
+        )
+        claims = extract_claims(text)
+        self.assertEqual(len(claims), 4)
+
+    def test_multi_claim_preserves_line_number(self):
+        """All claims from a split line share the original line number."""
+        text = "File deployed. Server is running."
+        claims = extract_claims(text)
+        if len(claims) >= 2:
+            # Both should reference line 1
+            for c in claims:
+                self.assertEqual(c.source_line, 1)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ class ClaimType(Enum):
     COUNT_CLAIM = "count_claim"          # "X entries / N items / count of Y"
     STATUS_CLAIM = "status_claim"        # general status assertions
     FACT_CLAIM = "fact_claim"            # factual claims (dates, numbers)
+    DATE_EXPIRY = "date_expiry"              # "expires Mon", "resolve Apr 5"
     REGISTRY_VIOLATION = "registry_violation"  # file/db not in SYSTEM_REGISTRY.md
     SUBJECTIVE = "subjective"            # opinions, assessments
 
@@ -83,6 +84,7 @@ class Claim:
     extracted_config_keys: List[str] = field(default_factory=list)  # Config keys to check
     context: str = ""                  # Surrounding text for context
     age_builds: int = 0                # How many builds this has persisted
+    confidence: float = 1.0            # 0.0-1.0 extraction confidence score
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -97,6 +99,7 @@ class Claim:
             "numbers": self.extracted_numbers,
             "config_keys": self.extracted_config_keys,
             "age_builds": self.age_builds,
+            "confidence": self.confidence,
         }
 
 
@@ -153,9 +156,11 @@ BLOCKER_RE = re.compile(
 )
 
 # Pipeline/script status patterns
+# Handles both "pipeline is working" and "pipeline: WORKING" and "pipeline: **WORKING**"
 PIPELINE_STATUS_RE = re.compile(
-    r'(?:pipeline|script|cron|process|service)\s+(?:is\s+)?'
-    r'(?:working|running|operational|active|healthy|broken|failing|down|blocked|stopped)',
+    r'(?:pipeline|script|cron|process|service)[\s:]+(?:is\s+)?\*{0,2}'
+    r'(?:working|running|operational|active|healthy|broken|failing|down|blocked|stopped)'
+    r'\*{0,2}',
     re.IGNORECASE,
 )
 
@@ -229,6 +234,131 @@ OPTIONAL_FILE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Env var natural-language status — "KEY is not set", "KEY missing", "KEY absent"
+# Catches env var claims OUTSIDE blocker context (blocker context handled separately).
+ENV_VAR_STATUS_RE = re.compile(
+    r'\b([A-Z][A-Z0-9_]{2,})\b'
+    r'\s+(?:is\s+)?'
+    r'(?:not\s+(?:set|configured|found|available|defined|present)'
+    r'|missing|absent|unset|unavailable)',
+    re.IGNORECASE,
+)
+
+# Status claims with error codes or expiry — "returned 403", "cookie expired"
+STATUS_ERROR_RE = re.compile(
+    r'(?:returned|got|received|threw|raised|hit)\s+(?:a\s+)?(\d{3})\s*(?:error|status|response)?'
+    r'|(?:has\s+)?(?:expired|timed?\s*out)'
+    r'|(?:returned|got|received)\s+(?:an?\s+)?error',
+    re.IGNORECASE,
+)
+
+# Standing item status pattern — catches "Label: STATUS" format in priority file bullet points.
+# These are common in the "Standing Items" section: "Substack cookie: **WORKING**",
+# "Substack responder: RE-ENABLED", "Notes posting: DISABLED".
+# Requires a bullet-point context (- or *) to avoid matching table rows or paragraphs.
+STANDING_STATUS_RE = re.compile(
+    r'^\s*[-*]\s+\*{0,2}[^:\n]{2,50}\*{0,2}\s*:\s*\*{0,2}'
+    r'(WORKING|RUNNING|BLOCKED|STOPPED|DISABLED|ENABLED|RE-ENABLED|OPERATIONAL|PARTIAL|ACTIVE|INACTIVE|PAUSED|COMPLETED|FAILED|BROKEN|DOWN|HEALTHY)'
+    r'\*{0,2}',
+    re.IGNORECASE,
+)
+
+# Fractional count pattern — "118/470 resolved", "30/33 posted"
+FRAC_COUNT_RE = re.compile(
+    r'(\d+)\s*/\s*(\d+)\s+(?:resolved|completed|done|passed|failed|processed|posted|published|remaining)',
+    re.IGNORECASE,
+)
+
+# Factual claims with specific numbers — "CPI at 3.5%", "Brent at $107", "rate is 4.2%"
+FACT_CLAIM_RE = re.compile(
+    r'(?:is\s+(?:at\s+)?|at\s+|was\s+(?:at\s+)?|hit\s+|reached\s+|stands?\s+at\s+|rose\s+to\s+|fell\s+to\s+|dropped\s+to\s+)'
+    r'(?:\$\s*)?\d+(?:[.,]\d+)?(?:\s*%)',
+    re.IGNORECASE,
+)
+
+# Date-verified staleness markers — "(verified: 2026-03-26 ...)" in section headers or inline.
+# These tag when data was last refreshed; the gate checks if they're stale (> threshold days).
+VERIFIED_DATE_RE = re.compile(
+    r'\(verified:?\s*(\d{4}-\d{2}-\d{2})\b[^)]*\)',
+    re.IGNORECASE,
+)
+
+# Portfolio monetary claims — "Cash: $200.91", "Total value: $475.28", "P&L: +$43.45"
+# Matches common portfolio-table patterns with dollar amounts.
+PORTFOLIO_VALUE_RE = re.compile(
+    r'(?:Cash|Total\s+value|Unrealized\s+P&?L|P&?L|Cost\s+basis|Balance)'
+    r'\s*[:=]\s*[+\-]?\$[\d,]+(?:\.\d{1,2})?',
+    re.IGNORECASE,
+)
+
+# Project pipeline counts — "11 leads", "5 modules", "3 contracts", "22 curated authors"
+# Catches domain-specific counts that go stale (e.g., Sentinel leads, Confab modules).
+PIPELINE_COUNT_RE = re.compile(
+    r'(?<!\w)(\d+)\s+(?:leads?|modules?|contracts?|positions?|dossiers?|authors?|targets?'
+    r'|candidates?|referrals?|signals?|monitors?|detections?|providers?)',
+    re.IGNORECASE,
+)
+
+# Date-expiry claims — lines containing BOTH expiry language AND a date reference.
+# Catches "expires Mon", "EXPIRY MON.", "resolve Apr 5", "Mon Mar 31: Gas contracts expire".
+# These are time-sensitive claims that become actionable (or stale) on a specific date.
+DATE_EXPIRY_WORD_RE = re.compile(
+    r'\b(?:expir(?:es?|y|ation|ing)|resolves?|deadline|due\b)',
+    re.IGNORECASE,
+)
+
+# Date references: day names, month+day, ISO dates, relative dates
+DATE_REF_RE = re.compile(
+    r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:day)?\b'
+    r'|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}\b'
+    r'|\b\d{4}-\d{2}-\d{2}\b'
+    r'|\b(?:TOMORROW|TODAY|YESTERDAY|NEXT\s+WEEK|THIS\s+WEEK)\b',
+    re.IGNORECASE,
+)
+
+# Approximate count pattern — "~65 published", "~320 entries"
+# These are explicitly excluded from COUNT_RE but still go stale.
+# Semi-verifiable: the exact number can be checked but tolerance is wider.
+APPROX_COUNT_RE = re.compile(
+    r'~(\d+)\s+(?:entries|items|posts|notes|files|tests|builds|sprints|days|hours|commits|'
+    r'observations|ideas|principles|scripts|databases|subscribers|views|published|posted|'
+    r'leads|modules|contracts|positions|dossiers|authors|targets|curated)',
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Generic agent output patterns (for non-ia agent text)
+# ---------------------------------------------------------------------------
+
+# Generic fractional count — "(42/42)", "42/42", "Tests pass (42/42)"
+# Broader than FRAC_COUNT_RE: doesn't require a trailing word like "passed/resolved".
+# Catches test results, progress counts, and inline ratios in prose.
+GENERIC_FRAC_RE = re.compile(
+    r'(\d+)\s*/\s*(\d+)',
+)
+
+# Positive env var status — "DATABASE_URL is set", "ENV var X is configured"
+# Complements ENV_VAR_STATUS_RE which only catches negative status ("not set", "missing").
+ENV_VAR_POSITIVE_RE = re.compile(
+    r'(?:ENV\s+(?:var(?:iable)?)\s+)?'
+    r'([A-Z][A-Z0-9_]{2,})'
+    r'\s+(?:(?:environment\s+)?(?:var(?:iable)?\s+)?)?'
+    r'(?:is\s+)?(?:set|configured|defined|present|available|exists)',
+    re.IGNORECASE,
+)
+
+# Inline file path in prose — "/tmp/test.yaml", "/etc/nginx/conf.d/app.conf"
+# Broader than FILE_PATH_RE: catches absolute paths without backticks in prose,
+# even without ia-specific directory structures like core/ or projects/.
+INLINE_PATH_RE = re.compile(
+    r'(?:^|[\s(])(/(?:[\w./-]+/)*[\w.-]+\.[\w]+)',
+)
+
+# Sentence boundary pattern for splitting multi-sentence lines.
+# Splits on ". " followed by an uppercase letter (new sentence), preserving
+# each sentence as a standalone unit for independent claim extraction.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=\.)\s+(?=[A-Z])')
+
 
 # ---------------------------------------------------------------------------
 # Claim extraction
@@ -288,7 +418,32 @@ def extract_claims(
     build_sections = list(BUILD_HEADER_RE.finditer(text))
     current_build_idx = 0
 
+    # Pre-process: expand multi-sentence lines into separate entries.
+    # Generic agent output often packs multiple claims into one line:
+    #   "File deployed. Tests pass (42/42). Server running."
+    # Each sentence may contain a distinct claim that would be masked by
+    # the first-match-then-continue logic. We split BEFORE the main loop
+    # so each sentence is processed independently.
+    expanded_lines: List[Tuple[int, str]] = []  # (original_line_num, text)
     for line_num, line in enumerate(lines, 1):
+        stripped_check = line.strip()
+        # Only split non-heading, non-empty, non-bullet lines with multiple sentences
+        if (stripped_check
+            and not stripped_check.startswith('#')
+            and not stripped_check.startswith('|')
+            and '.' in stripped_check):
+            subs = _SENTENCE_SPLIT_RE.split(stripped_check)
+            if len(subs) > 1:
+                for sub in subs:
+                    # Re-apply leading whitespace style from original for bullet detection
+                    if line.lstrip().startswith(('-', '*')):
+                        expanded_lines.append((line_num, sub))
+                    else:
+                        expanded_lines.append((line_num, sub))
+                continue
+        expanded_lines.append((line_num, line))
+
+    for line_num, line in expanded_lines:
         # Update build section tracking
         for i, m in enumerate(build_sections):
             if m.start() <= sum(len(l) + 1 for l in lines[:line_num - 1]):
@@ -319,8 +474,27 @@ def extract_claims(
         if in_excluded_section:
             continue
 
-        # Skip headers, empty lines, and table formatting
-        if not stripped or stripped.startswith('#') or stripped.startswith('|---'):
+        # Skip empty lines and table formatting
+        if not stripped or stripped.startswith('|---'):
+            continue
+
+        # Extract verified-date markers from headings before skipping them.
+        # Headings like "## Portfolio Status (verified: 2026-03-26 ...)" carry
+        # staleness signals that the gate should track.
+        if stripped.startswith('#'):
+            verified_heading_match = VERIFIED_DATE_RE.search(line)
+            if verified_heading_match:
+                vtag_match = VERIFICATION_TAG_RE.search(line)
+                claims.append(Claim(
+                    text=stripped.lstrip('#').strip(),
+                    claim_type=ClaimType.FACT_CLAIM,
+                    verifiability=VerifiabilityLevel.SEMI,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag_match.group(0) if vtag_match else None,
+                    extracted_numbers=[verified_heading_match.group(1)],
+                    age_builds=current_build_idx,
+                ))
             continue
 
         # Skip meta-rules about claim handling (e.g. "**Staleness rule:** ...")
@@ -360,6 +534,30 @@ def extract_claims(
                 claims.append(claim)
             continue
 
+        # --- Standing item status claims ("Label: STATUS" in bullet points) ---
+        standing_match = STANDING_STATUS_RE.match(line)
+        if standing_match and not _is_process_status_claim(line):
+            # Determine if it's pipeline-related or general status
+            lower = line.lower()
+            if 'pipeline' in lower:
+                claim = _classify_status_claim(
+                    line, source_file, line_num, vtag, current_build_idx
+                )
+            else:
+                claim = Claim(
+                    text=stripped,
+                    claim_type=ClaimType.STATUS_CLAIM,
+                    verifiability=VerifiabilityLevel.SEMI,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_paths=_extract_file_paths(line),
+                    age_builds=current_build_idx,
+                )
+            if claim:
+                claims.append(claim)
+            continue
+
         # --- Pipeline/script status claims ---
         if PIPELINE_STATUS_RE.search(line):
             claim = _classify_status_claim(
@@ -367,6 +565,60 @@ def extract_claims(
             )
             if claim:
                 claims.append(claim)
+            continue
+
+        # --- Env var status claims (standalone, outside blocker context) ---
+        env_status_match = ENV_VAR_STATUS_RE.search(line)
+        if env_status_match:
+            var_name = env_status_match.group(1)
+            all_known = _get_all_known_env_vars()
+            # Only extract if it looks like a real env var (known, or ends with common suffix)
+            if var_name in all_known or var_name.endswith(
+                ('_KEY', '_TOKEN', '_SECRET', '_COOKIE', '_URL', '_PATH', '_API', '_ID', '_PASSWORD')
+            ):
+                claims.append(Claim(
+                    text=stripped,
+                    claim_type=ClaimType.ENV_VAR,
+                    verifiability=VerifiabilityLevel.AUTO,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_env_vars=[var_name],
+                    age_builds=current_build_idx,
+                ))
+                continue
+
+        # --- Positive env var status: "ENV var X is set", "DATABASE_URL is configured" ---
+        env_pos_match = ENV_VAR_POSITIVE_RE.search(line)
+        if env_pos_match:
+            var_name = env_pos_match.group(1)
+            all_known = _get_all_known_env_vars()
+            if var_name in all_known or var_name.endswith(
+                ('_KEY', '_TOKEN', '_SECRET', '_COOKIE', '_URL', '_PATH', '_API', '_ID', '_PASSWORD')
+            ):
+                claims.append(Claim(
+                    text=stripped,
+                    claim_type=ClaimType.ENV_VAR,
+                    verifiability=VerifiabilityLevel.AUTO,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_env_vars=[var_name],
+                    age_builds=current_build_idx,
+                ))
+                continue
+
+        # --- Status/error claims (error codes, expiry, timeouts) ---
+        if STATUS_ERROR_RE.search(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.STATUS_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
             continue
 
         # --- File path and config file references in assertion context ---
@@ -401,22 +653,137 @@ def extract_claims(
 
         # --- Count/quantity claims ---
         count_matches = COUNT_RE.findall(line)
-        if count_matches and _is_assertion_context(line) and not _is_directive_context(line):
+        frac_match = FRAC_COUNT_RE.search(line)
+        if (count_matches or frac_match) and _is_assertion_context(line) and not _is_directive_context(line):
+            numbers = list(count_matches)
+            if frac_match:
+                numbers.extend([frac_match.group(1), frac_match.group(2)])
+            # Auto-verifiable if claim matches a configured count_source
+            is_auto = _matches_count_source(stripped)
             claim = Claim(
+                text=stripped,
+                claim_type=ClaimType.COUNT_CLAIM,
+                verifiability=VerifiabilityLevel.AUTO if is_auto else VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=numbers,
+                age_builds=current_build_idx,
+            )
+            claims.append(claim)
+            continue
+
+        # --- Generic fractional counts: "(42/42)", "Tests pass (10/10)" ---
+        # Catches test results and progress ratios that FRAC_COUNT_RE misses
+        # (because FRAC_COUNT_RE requires trailing words like "passed/resolved").
+        # No assertion context gate: a bare N/M ratio IS the assertion.
+        generic_frac_match = GENERIC_FRAC_RE.search(line)
+        if generic_frac_match and not _is_directive_context(line):
+            claims.append(Claim(
                 text=stripped,
                 claim_type=ClaimType.COUNT_CLAIM,
                 verifiability=VerifiabilityLevel.SEMI,
                 source_file=source_file,
                 source_line=line_num,
                 verification_tag=vtag,
-                extracted_numbers=count_matches,
+                extracted_numbers=[generic_frac_match.group(1), generic_frac_match.group(2)],
                 age_builds=current_build_idx,
-            )
-            claims.append(claim)
+            ))
+            continue
 
-    # Sort: auto-verifiable first, then semi, then manual
+        # --- Fact claims with specific numbers (percentages, prices) ---
+        if FACT_CLAIM_RE.search(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.FACT_CLAIM,
+                verifiability=VerifiabilityLevel.MANUAL,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Date-verified staleness markers: (verified: YYYY-MM-DD) ---
+        verified_match = VERIFIED_DATE_RE.search(line)
+        if verified_match:
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.FACT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=[verified_match.group(1)],
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Portfolio monetary claims: Cash: $NNN, Total value: $NNN ---
+        if PORTFOLIO_VALUE_RE.search(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.FACT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Date-expiry claims: "expires Mon", "resolve Apr 5", "EXPIRY MON." ---
+        has_expiry_word = DATE_EXPIRY_WORD_RE.search(line)
+        has_date_ref = DATE_REF_RE.search(line)
+        if has_expiry_word and has_date_ref:
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.DATE_EXPIRY,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Pipeline/project counts: N leads, N modules, N contracts ---
+        pipeline_count_matches = PIPELINE_COUNT_RE.findall(line)
+        if pipeline_count_matches and _is_assertion_context(line) and not _is_directive_context(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.COUNT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=list(pipeline_count_matches),
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Approximate count claims: ~65 published, ~320 entries ---
+        approx_matches = APPROX_COUNT_RE.findall(line)
+        if approx_matches and _is_assertion_context(line) and not _is_directive_context(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.COUNT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=list(approx_matches),
+                confidence=0.7,  # Lower confidence for approximate claims
+                age_builds=current_build_idx,
+            ))
+
+    # Score confidence for each claim
+    for claim in claims:
+        claim.confidence = score_confidence(claim)
+
+    # Sort: auto-verifiable first, then semi, then manual; within each level, by confidence desc
     priority = {VerifiabilityLevel.AUTO: 0, VerifiabilityLevel.SEMI: 1, VerifiabilityLevel.MANUAL: 2}
-    claims.sort(key=lambda c: (priority[c.verifiability], -c.age_builds))
+    claims.sort(key=lambda c: (priority[c.verifiability], -c.confidence, -c.age_builds))
 
     return claims
 
@@ -435,11 +802,13 @@ def _is_assertion_context(line: str) -> bool:
     """Check if a line contains an assertion (not just a reference)."""
     assertion_words = {
         'exists', 'ready', 'working', 'works', 'runs', 'running',
-        'blocked', 'broken', 'failing', 'missing', 'needs', 'requires',
+        'blocked', 'broken', 'failing', 'failed', 'missing', 'needs', 'requires',
         'present', 'configured', 'deployed', 'operational', 'healthy',
         'queued', 'pending', 'complete', 'completed', 'done', 'fixed',
         'added', 'created', 'updated', 'verified', 'confirmed',
         'status', 'still', 'not', 'should', 'must',
+        'passing', 'passed', 'set', 'expired', 'returned', 'error',
+        'resolved', 'posted', 'published', 'remaining',
     }
     lower = line.lower()
     return any(word in lower for word in assertion_words)
@@ -617,6 +986,41 @@ def _classify_blocker_claim(
     )
 
 
+def _matches_count_source(text: str) -> bool:
+    """Check if claim text matches a configured count_source keyword set.
+
+    If so, the verifier can check the count against a data source — making
+    it auto-verifiable instead of semi.
+    """
+    try:
+        from .config import get_config
+        lower = text.lower()
+        for source_key in get_config().count_sources:
+            keywords = source_key.replace("_", " ").split()
+            if all(kw in lower for kw in keywords):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _matches_pipeline_name(text: str) -> bool:
+    """Check if claim text matches a configured pipeline_names keyword.
+
+    If so, the verifier can resolve the pipeline status by name — making
+    it auto-verifiable even without explicit file paths in the claim.
+    """
+    try:
+        from .config import get_config
+        lower = text.lower()
+        for keyword in get_config().pipeline_names:
+            if keyword.lower() in lower:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _classify_status_claim(
     line: str,
     source_file: Optional[str],
@@ -639,10 +1043,13 @@ def _classify_status_claim(
     # Extract any file paths (scripts being referenced)
     file_paths = _extract_file_paths(line)
 
+    # Auto-verifiable if file paths found OR if claim matches a configured pipeline name
+    is_auto = bool(file_paths) or _matches_pipeline_name(line)
+
     return Claim(
         text=line.strip(),
         claim_type=claim_type,
-        verifiability=VerifiabilityLevel.AUTO if file_paths else VerifiabilityLevel.SEMI,
+        verifiability=VerifiabilityLevel.AUTO if is_auto else VerifiabilityLevel.SEMI,
         source_file=source_file,
         source_line=line_num,
         verification_tag=vtag,
@@ -732,6 +1139,112 @@ def parse_vtag_timestamp(vtag: str) -> Optional[datetime]:
     return None
 
 
+def score_confidence(claim: Claim) -> float:
+    """Score extraction confidence for a claim (0.0-1.0).
+
+    Confidence reflects how certain the extractor is that:
+    1. This text IS a verifiable claim (not noise)
+    2. The classification is correct
+    3. The extracted artifacts (paths, env vars, etc.) are accurate
+
+    Scoring factors:
+    - Specificity: concrete artifacts (paths, env vars) > vague assertions
+    - Verifiability: AUTO > SEMI > MANUAL
+    - Pattern strength: blocker/env var patterns are high-signal
+    - Verification tags: tagged claims have human confirmation of claim-ness
+    - Age: older unverified claims decay in confidence
+    """
+    score = 0.5  # Base: the extractor matched a pattern
+
+    # Specificity bonus: concrete extracted artifacts
+    if claim.extracted_paths:
+        score += 0.2
+    if claim.extracted_env_vars:
+        score += 0.2
+    if claim.extracted_config_keys:
+        score += 0.1
+    if claim.extracted_numbers:
+        score += 0.1
+
+    # Verifiability bonus: auto-verifiable = higher confidence
+    if claim.verifiability == VerifiabilityLevel.AUTO:
+        score += 0.15
+    elif claim.verifiability == VerifiabilityLevel.SEMI:
+        score += 0.05
+    # MANUAL gets no bonus
+
+    # Claim type signal strength
+    high_signal_types = {
+        ClaimType.FILE_EXISTS, ClaimType.FILE_MISSING,
+        ClaimType.ENV_VAR, ClaimType.CONFIG_PRESENT,
+    }
+    medium_signal_types = {
+        ClaimType.PIPELINE_WORKS, ClaimType.PIPELINE_BLOCKED,
+        ClaimType.SCRIPT_RUNS, ClaimType.SCRIPT_BROKEN,
+        ClaimType.PROCESS_STATUS, ClaimType.COUNT_CLAIM,
+    }
+    if claim.claim_type in high_signal_types:
+        score += 0.1
+    elif claim.claim_type in medium_signal_types:
+        score += 0.05
+
+    # Verification tag bonus: someone already tagged this
+    if claim.verification_tag:
+        if 'v2' in (claim.verification_tag or ''):
+            score += 0.1  # Two agents confirmed
+        elif 'v1' in (claim.verification_tag or ''):
+            score += 0.05  # One agent verified
+        elif 'FAILED' in (claim.verification_tag or ''):
+            score += 0.05  # Tagged as failed = confirmed as claim
+
+    # Age penalty: older unverified claims are less trustworthy
+    if claim.age_builds > 0 and not claim.verification_tag:
+        score -= min(0.15, claim.age_builds * 0.03)
+
+    return max(0.0, min(1.0, round(score, 2)))
+
+
+def flag_stale_vtags(
+    claims: List[Claim],
+    max_age_hours: float = 24.0,
+    now: Optional[datetime] = None,
+) -> List[Tuple[Claim, float]]:
+    """Identify claims with verification tags older than a threshold.
+
+    Returns a list of (claim, age_hours) tuples for claims whose vtag
+    timestamp is older than max_age_hours. Behavior claims (pipeline
+    status, process state) use a shorter default TTL because they
+    represent transient runtime state.
+
+    Args:
+        claims: Claims to check.
+        max_age_hours: Threshold in hours. Claims verified more recently
+            than this are not flagged. Default: 24h.
+        now: Current time (for testing). Defaults to utcnow.
+
+    Returns:
+        List of (claim, age_hours) tuples, sorted by age descending.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    stale = []
+    for claim in claims:
+        if not claim.verification_tag:
+            continue
+        ts = parse_vtag_timestamp(claim.verification_tag)
+        if ts is None:
+            continue
+        age_hours = (now - ts).total_seconds() / 3600.0
+        # Behavior claims get a tighter TTL (half the threshold)
+        threshold = max_age_hours / 2 if is_behavior_claim(claim) else max_age_hours
+        if age_hours > threshold:
+            stale.append((claim, round(age_hours, 1)))
+
+    stale.sort(key=lambda x: -x[1])
+    return stale
+
+
 def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:
     """Generate a summary of extracted claims."""
     by_type = {}
@@ -740,6 +1253,7 @@ def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:
         by_type[c.claim_type.value] = by_type.get(c.claim_type.value, 0) + 1
         by_verifiability[c.verifiability.value] = by_verifiability.get(c.verifiability.value, 0) + 1
 
+    confidences = [c.confidence for c in claims]
     return {
         "total": len(claims),
         "by_type": by_type,
@@ -747,4 +1261,7 @@ def summarize_claims(claims: List[Claim]) -> Dict[str, Any]:
         "auto_verifiable": by_verifiability.get("auto", 0),
         "oldest_build_age": max((c.age_builds for c in claims), default=0),
         "untagged": sum(1 for c in claims if c.verification_tag is None),
+        "avg_confidence": round(sum(confidences) / len(confidences), 2) if confidences else 0.0,
+        "high_confidence": sum(1 for c in confidences if c >= 0.8),
+        "low_confidence": sum(1 for c in confidences if c < 0.5),
     }

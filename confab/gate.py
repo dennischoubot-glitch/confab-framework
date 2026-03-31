@@ -51,16 +51,25 @@ from .verify import (
 )
 
 # Import operational constants from centralized config (core/config.py)
-# Uses importlib.util to work both as package import and standalone script
+# Uses importlib.util to work both as package import and standalone script.
+# Falls back to defaults when running outside the ia workspace.
 import importlib.util as _ilu
 _cfg_path = Path(__file__).resolve().parent.parent / "config.py"
-_spec = _ilu.spec_from_file_location("ia_config", str(_cfg_path))
-_cfg = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_cfg)
-STALE_BUILD_THRESHOLD = _cfg.STALE_CLAIM_BUILD_THRESHOLD
-PST = _cfg.TIMEZONE
-RESPONDER_DAILY_REPLY_LIMIT = _cfg.SUBSTACK_DAILY_REPLY_LIMIT
-RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = _cfg.SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT
+try:
+    _spec = _ilu.spec_from_file_location("ia_config", str(_cfg_path))
+    _cfg = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg)
+    STALE_BUILD_THRESHOLD = _cfg.STALE_CLAIM_BUILD_THRESHOLD
+    PST = _cfg.TIMEZONE
+    RESPONDER_DAILY_REPLY_LIMIT = _cfg.SUBSTACK_DAILY_REPLY_LIMIT
+    RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = _cfg.SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT
+except (FileNotFoundError, AttributeError, TypeError):
+    # Standalone mode — ia config not available, use sensible defaults
+    import zoneinfo
+    STALE_BUILD_THRESHOLD = 3
+    PST = zoneinfo.ZoneInfo("America/Los_Angeles")
+    RESPONDER_DAILY_REPLY_LIMIT = 30
+    RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 2
 
 
 def check_journal_cadence() -> Dict[str, Any]:
@@ -194,6 +203,7 @@ class GateReport:
     all_outcomes: List[VerificationOutcome]
     registry_violations: List[Dict[str, Any]] = field(default_factory=list)
     ttl_expired: List[Dict[str, Any]] = field(default_factory=list)  # Behavior claims past TTL
+    stale_drift_details: List[Dict[str, Any]] = field(default_factory=list)  # Claims correct when written but source changed
     journal_cadence: Optional[Dict[str, Any]] = None  # Time-slot-based journal limit
     responder_cadence: Optional[Dict[str, Any]] = None  # Daily responder limits
     # Tracker metadata (populated when tracker is enabled)
@@ -204,6 +214,10 @@ class GateReport:
     @property
     def has_failures(self) -> bool:
         return self.failed > 0
+
+    @property
+    def has_stale_drift(self) -> bool:
+        return len(self.stale_drift_details) > 0
 
     @property
     def has_stale(self) -> bool:
@@ -241,6 +255,7 @@ class GateReport:
             "inconclusive": self.inconclusive,
             "skipped": self.skipped,
             "stale_claims": self.stale_claims,
+            "stale_drift": self.stale_drift_details,
             "registry_violations": self.registry_violations,
             "ttl_expired": self.ttl_expired,
             "journal_cadence": self.journal_cadence,
@@ -283,9 +298,12 @@ class GateReport:
             if rc["status"] == "BLOCKED":
                 lines.append("- **Responder daily budget exhausted.**")
 
-        if self.clean and not self.journal_blocked:
+        if self.clean and not self.journal_blocked and not self.has_stale_drift:
             lines.append("\n**GATE: CLEAN** — No failed verifications or stale claims.")
             return "\n".join(lines)
+
+        if self.clean and not self.journal_blocked and self.has_stale_drift:
+            lines.append(f"\n**GATE: CLEAN** — No confabulations. {len(self.stale_drift_details)} claim(s) drifted since last verification.")
 
         if self.has_failures:
             lines.append(f"\n## FAILED VERIFICATIONS ({self.failed})")
@@ -298,6 +316,20 @@ class GateReport:
                     lines.append(f"  Source: {detail['source_file']}:{detail.get('source_line', '?')}")
                 lines.append(f"  Evidence: {detail['evidence']}")
                 lines.append(f"  Action: {detail['action']}")
+                lines.append("")
+
+        if self.has_stale_drift:
+            lines.append(f"\n## STALE DRIFT ({len(self.stale_drift_details)})")
+            lines.append("")
+            lines.append("These claims were correct when written but the source data changed since:")
+            lines.append("")
+            for detail in self.stale_drift_details:
+                lines.append(f"**Claim:** {detail['claim_text']}")
+                if detail.get('source_file'):
+                    lines.append(f"  Source: {detail['source_file']}:{detail.get('source_line', '?')}")
+                lines.append(f"  Evidence: {detail['evidence']}")
+                lines.append(f"  Changed: {detail.get('changed_file', '?')} modified {detail.get('drift_description', 'after verification')}")
+                lines.append(f"  Action: Re-verify and update the claim to reflect current state.")
                 lines.append("")
 
         if self.has_stale:
@@ -341,6 +373,7 @@ class GateReport:
         lines.append("## Summary")
         lines.append(f"- Passed: {self.passed}/{self.auto_verified} auto-verified ({passed_pct:.0f}%)")
         lines.append(f"- Failed: {self.failed}")
+        lines.append(f"- Stale drift: {len(self.stale_drift_details)}")
         lines.append(f"- Inconclusive: {self.inconclusive}")
         lines.append(f"- Stale: {self.stale_claims}")
         lines.append(f"- TTL-expired: {len(self.ttl_expired)}")
@@ -376,6 +409,8 @@ class GateReport:
 
         if self.has_failures:
             lines.append("## :x: Confab Gate — Failed")
+        elif self.has_stale_drift:
+            lines.append("## :arrows_counterclockwise: Confab Gate — Stale Drift")
         elif self.has_ttl_expired:
             lines.append("## :warning: Confab Gate — TTL-Expired Behavior Claims")
         elif self.has_stale:
@@ -390,6 +425,8 @@ class GateReport:
         lines.append(f"| Claims scanned | {self.total_claims} |")
         lines.append(f"| Passed | {self.passed} |")
         lines.append(f"| Failed | {self.failed} |")
+        if self.stale_drift_details:
+            lines.append(f"| Stale drift | {len(self.stale_drift_details)} |")
         lines.append(f"| Stale | {self.stale_claims} |")
         lines.append(f"| Inconclusive | {self.inconclusive} |")
         if self.ttl_expired:
@@ -408,6 +445,17 @@ class GateReport:
                     lines.append(f"  - Source: `{detail['source_file']}:{detail.get('source_line', '?')}`")
                 lines.append(f"  - Evidence: {detail['evidence'].split(chr(10))[0][:120]}")
                 lines.append(f"  - Action: {detail['action']}")
+
+        # Stale drift
+        if self.has_stale_drift:
+            lines.append("")
+            lines.append("### Stale Drift (source changed after verification)")
+            lines.append("")
+            for detail in self.stale_drift_details[:10]:
+                lines.append(f"- **{detail['claim_text'][:120]}**")
+                lines.append(f"  - Changed: `{detail.get('changed_file', '?')}`")
+            if len(self.stale_drift_details) > 10:
+                lines.append(f"- *...and {len(self.stale_drift_details) - 10} more*")
 
         # Stale claims
         if self.has_stale:
@@ -465,6 +513,8 @@ class GateReport:
         status_parts = []
         if self.failed > 0:
             status_parts.append(f":x: {self.failed} FAILED")
+        if self.has_stale_drift:
+            status_parts.append(f":arrows_counterclockwise: {len(self.stale_drift_details)} stale-drift")
         if self.has_ttl_expired:
             status_parts.append(f":clock3: {len(self.ttl_expired)} TTL-expired")
         if self.stale_claims > 0:
@@ -485,6 +535,18 @@ class GateReport:
                 lines.append(f":x: {claim_short}")
                 evidence_short = detail['evidence'].split('\n')[0][:80]
                 lines.append(f"  {evidence_short}")
+
+        # Stale drift details (compact, max 3)
+        if self.has_stale_drift:
+            lines.append("")
+            shown = self.stale_drift_details[:3]
+            for detail in shown:
+                claim_short = detail['claim_text'][:80]
+                lines.append(f":arrows_counterclockwise: {claim_short}")
+                lines.append(f"  Source changed: {detail.get('changed_file', '?')}")
+            remaining = len(self.stale_drift_details) - len(shown)
+            if remaining > 0:
+                lines.append(f"  ...and {remaining} more stale-drift claims")
 
         # Stale details (compact, max 3)
         if self.has_stale:
@@ -524,6 +586,82 @@ class GateReport:
             lines.append(f"\nRun #{self.tracker_total_runs} | {self.tracker_new} new, {self.tracker_returning} returning")
 
         return "\n".join(lines)
+
+
+def _classify_stale_drift(
+    outcomes: List[VerificationOutcome],
+) -> tuple:
+    """Separate FAILED outcomes into true failures and stale drift.
+
+    Stale drift: the claim was correct when written but the underlying data
+    file changed after the claim's verification timestamp. This is natural
+    drift (e.g., a new note was added to the queue after the builder reported
+    15/15), not a confabulation.
+
+    Returns:
+        (true_failed: list of FAILED outcomes,
+         stale_drift: list of (outcome, detail_dict) for STALE_DRIFT)
+    """
+    import os
+
+    true_failed = []
+    stale_drift = []
+
+    for outcome in outcomes:
+        if outcome.result != VerificationResult.FAILED:
+            continue
+
+        # Can only classify as drift if the claim has a verification timestamp
+        vtag_time = None
+        if outcome.claim.verification_tag:
+            vtag_time = parse_vtag_timestamp(outcome.claim.verification_tag)
+
+        if vtag_time is None or not outcome.checked_paths:
+            true_failed.append(outcome)
+            continue
+
+        # Check if any data file was modified after the vtag timestamp
+        drift_detected = False
+        changed_file = None
+        file_mtime = None
+        for path_str in outcome.checked_paths:
+            try:
+                mtime = os.path.getmtime(path_str)
+                mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                if mtime_dt > vtag_time:
+                    drift_detected = True
+                    changed_file = path_str
+                    file_mtime = mtime_dt
+                    break
+            except OSError:
+                continue
+
+        if drift_detected:
+            # Format relative path for display
+            config = get_config()
+            try:
+                display_path = str(Path(changed_file).relative_to(config.workspace_root))
+            except (ValueError, TypeError):
+                display_path = changed_file
+
+            vtag_str = vtag_time.strftime('%Y-%m-%d %H:%M UTC')
+            mtime_str = file_mtime.strftime('%Y-%m-%d %H:%M UTC') if file_mtime else '?'
+            drift_desc = f"at {mtime_str} (claim verified at {vtag_str})"
+
+            detail = {
+                "claim_text": outcome.claim.text[:200],
+                "claim_type": outcome.claim.claim_type.value,
+                "source_file": outcome.claim.source_file,
+                "source_line": outcome.claim.source_line,
+                "evidence": outcome.evidence,
+                "changed_file": display_path,
+                "drift_description": drift_desc,
+            }
+            stale_drift.append((outcome, detail))
+        else:
+            true_failed.append(outcome)
+
+    return true_failed, stale_drift
 
 
 def run_gate(
@@ -587,18 +725,21 @@ def run_gate(
     # Run verification
     outcomes = verify_all(all_claims)
 
-    # Identify failed verifications
+    # Classify FAILED verifications into true failures vs stale drift
+    true_failed_outcomes, stale_drift_pairs = _classify_stale_drift(outcomes)
+
     failed_details = []
-    for outcome in outcomes:
-        if outcome.result == VerificationResult.FAILED:
-            failed_details.append({
-                "claim_text": outcome.claim.text[:200],
-                "claim_type": outcome.claim.claim_type.value,
-                "source_file": outcome.claim.source_file,
-                "source_line": outcome.claim.source_line,
-                "evidence": outcome.evidence,
-                "action": _suggest_action(outcome),
-            })
+    for outcome in true_failed_outcomes:
+        failed_details.append({
+            "claim_text": outcome.claim.text[:200],
+            "claim_type": outcome.claim.claim_type.value,
+            "source_file": outcome.claim.source_file,
+            "source_line": outcome.claim.source_line,
+            "evidence": outcome.evidence,
+            "action": _suggest_action(outcome),
+        })
+
+    stale_drift_details = [detail for _, detail in stale_drift_pairs]
 
     # Identify stale claims from in-file build section counting (original method)
     stale_details = []
@@ -695,12 +836,14 @@ def run_gate(
     # Responder cadence check (daily limits)
     responder_cadence = check_responder_cadence()
 
-    # Count results
+    # Count results — subtract stale_drift from failed count
     result_counts = {}
     for o in outcomes:
         result_counts[o.result.value] = result_counts.get(o.result.value, 0) + 1
 
     auto_count = sum(1 for o in outcomes if o.result != VerificationResult.SKIPPED)
+    # Stale drift items are technically FAILED in verify but reclassified here
+    true_failed_count = result_counts.get("failed", 0) - len(stale_drift_details)
 
     return GateReport(
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -708,7 +851,7 @@ def run_gate(
         total_claims=len(all_claims),
         auto_verified=auto_count,
         passed=result_counts.get("passed", 0),
-        failed=result_counts.get("failed", 0),
+        failed=true_failed_count,
         inconclusive=result_counts.get("inconclusive", 0),
         skipped=result_counts.get("skipped", 0),
         stale_claims=len(stale_details),
@@ -717,6 +860,7 @@ def run_gate(
         all_outcomes=outcomes,
         registry_violations=registry_violations,
         ttl_expired=ttl_expired,
+        stale_drift_details=stale_drift_details,
         journal_cadence=journal_cadence,
         responder_cadence=responder_cadence,
         tracker_new=tracker_new,
@@ -1239,6 +1383,8 @@ def quick_check(file_path: Optional[str] = None) -> str:
     parts = []
     if report.failed > 0:
         parts.append(f"{report.failed} FAILED")
+    if report.has_stale_drift:
+        parts.append(f"{len(report.stale_drift_details)} STALE_DRIFT")
     if report.stale_claims > 0:
         parts.append(f"{report.stale_claims} STALE")
 

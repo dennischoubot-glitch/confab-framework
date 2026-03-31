@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -50,6 +50,7 @@ class VerificationOutcome:
     evidence: str              # What was checked and what was found
     checked_at: str            # ISO timestamp
     method: str                # How it was verified
+    checked_paths: List[str] = field(default_factory=list)  # Data files read during verification
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -58,6 +59,7 @@ class VerificationOutcome:
             "evidence": self.evidence,
             "checked_at": self.checked_at,
             "method": self.method,
+            "checked_paths": self.checked_paths,
         }
 
 
@@ -66,7 +68,7 @@ class VerificationOutcome:
 # ---------------------------------------------------------------------------
 
 def _resolve_path(path_str: str) -> Path:
-    """Resolve a path relative to workspace root.
+    """Resolve a path relative to cwd first, then workspace root.
 
     If direct resolution fails, search the repo by filename via rglob.
     For paths with directory components (e.g. 'examples/__init__.py'),
@@ -77,6 +79,11 @@ def _resolve_path(path_str: str) -> Path:
     p = Path(path_str)
     if p.is_absolute():
         return p
+
+    # Try cwd first (supports external use outside ia repo)
+    cwd_path = Path.cwd() / path_str
+    if cwd_path.exists():
+        return cwd_path
 
     direct = root / path_str
     if direct.exists():
@@ -114,9 +121,11 @@ def _resolve_path(path_str: str) -> Path:
 def verify_file_exists(paths: List[str]) -> VerificationOutcome:
     """Verify that claimed files exist on disk."""
     results = []
+    resolved_paths = []
     all_exist = True
     for path_str in paths:
         resolved = _resolve_path(path_str)
+        resolved_paths.append(str(resolved))
         exists = resolved.exists()
         results.append(f"  {path_str}: {'EXISTS' if exists else 'MISSING'}")
         if not exists:
@@ -129,6 +138,7 @@ def verify_file_exists(paths: List[str]) -> VerificationOutcome:
         evidence=evidence,
         checked_at=datetime.now(timezone.utc).isoformat(),
         method="filesystem_check",
+        checked_paths=resolved_paths,
     )
 
 
@@ -158,12 +168,22 @@ def verify_env_var(env_vars: List[str]) -> VerificationOutcome:
     results = []
     all_found = False  # For blocker claims, finding the var means the blocker is FALSE
 
-    # Check .env files
+    # Check .env files — search cwd and workspace root
     root = _get_workspace_root()
-    env_files = list(root.rglob(".env"))
+    cwd = Path.cwd()
+    env_files = list(cwd.rglob(".env")) if cwd != root else []
+    env_files.extend(root.rglob(".env"))
+    # Deduplicate by resolved path
+    seen = set()
+    unique_env_files = []
+    for ef in env_files:
+        resolved = ef.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_env_files.append(ef)
     env_file_vars: Dict[str, str] = {}
 
-    for env_file in env_files:
+    for env_file in unique_env_files:
         try:
             content = env_file.read_text()
             for line in content.split('\n'):
@@ -173,7 +193,11 @@ def verify_env_var(env_vars: List[str]) -> VerificationOutcome:
                     key = key.strip()
                     val = val.strip().strip('"').strip("'")
                     if val:  # Only count if value is non-empty
-                        env_file_vars[key] = str(env_file.relative_to(root))
+                        try:
+                            rel = str(env_file.relative_to(root))
+                        except ValueError:
+                            rel = str(env_file)
+                        env_file_vars[key] = rel
         except (OSError, UnicodeDecodeError):
             continue
 
@@ -969,6 +993,10 @@ def verify_count(claim: Claim) -> VerificationOutcome:
                 return _verify_json_array_count(claim, root, now, source_cfg)
             elif source_type == "regex_count":
                 return _verify_regex_count(claim, root, now, source_cfg)
+            elif source_type == "notes_queue":
+                return _verify_notes_queue_count(claim, root, now, source_cfg)
+            elif source_type == "knowledge_tree_stats":
+                return _verify_prediction_resolution(claim, root, now)
 
     # Built-in: test count (always available, no config needed)
     # Must check for "N tests" pattern specifically, not just substring "test".
@@ -1065,6 +1093,7 @@ def _verify_json_array_count(
         return VerificationOutcome(
             claim=claim, result=result, evidence=evidence,
             checked_at=now, method="count_check",
+            checked_paths=[str(file_path)],
         )
     except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
         return VerificationOutcome(
@@ -1179,12 +1208,194 @@ def _verify_regex_count(
         return VerificationOutcome(
             claim=claim, result=result, evidence=evidence,
             checked_at=now, method="count_check",
+            checked_paths=[str(file_path)],
         )
     except (ValueError, IndexError) as e:
         return VerificationOutcome(
             claim=claim, result=VerificationResult.INCONCLUSIVE,
             evidence=f"Error checking count from {source_cfg['file']}: {e}",
             checked_at=now, method="count_check",
+        )
+
+
+def _verify_notes_queue_count(
+    claim: Claim, root: Path, now: str, source_cfg: dict,
+) -> VerificationOutcome:
+    """Verify Notes queue count claims by parsing posted/unposted markers.
+
+    Handles claims like:
+    - "3 unposted Notes remain (31/34 posted)"
+    - "31/35 posted"
+    - "4 unposted Notes"
+
+    A note is "posted" if EITHER its header has ~~strikethrough~~ markers
+    OR its slug appears in the .notes_posted tracking file. This matches
+    the logic in post_note.py's _is_posted().
+    """
+    file_path = root / source_cfg.get("file", "projects/synthesis/scripts/notes_queue.md")
+    if not file_path.exists():
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.FAILED,
+            evidence=f"Notes queue file not found: {file_path}",
+            checked_at=now, method="notes_queue_count",
+        )
+
+    try:
+        content = file_path.read_text()
+
+        # Load .notes_posted tracking file (slugs of posted notes)
+        posted_file = root / "projects" / "synthesis" / "scripts" / ".notes_posted"
+        posted_slugs: set = set()
+        if posted_file.exists():
+            posted_slugs = {
+                line.strip() for line in posted_file.read_text().splitlines()
+                if line.strip()
+            }
+
+        # Parse note headers and determine posted status
+        # Headers: "### Note: Title" (unposted) or "### ~~Note: Title~~ (POSTED)" (posted)
+        # Also h2 variants: "## ~~Note: Title~~"
+        note_header_re = re.compile(
+            r'^(##?#?)\s+(~~)?Note:\s+(.+?)(?:~~)?\s*(?:\(POSTED.*\))?\s*$',
+            re.MULTILINE,
+        )
+        actual_total = 0
+        actual_posted = 0
+        for m in note_header_re.finditer(content):
+            actual_total += 1
+            has_strikethrough = m.group(2) == "~~"
+            title = m.group(3).strip().rstrip("~~").strip()
+            # Generate slug to check against .notes_posted
+            slug = "note-" + re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+            if has_strikethrough or slug in posted_slugs:
+                actual_posted += 1
+
+        actual_unposted = actual_total - actual_posted
+
+        claim_lower = claim.text.lower()
+        checks = []
+
+        # Parse fractional format: "31/34 posted" or "31/35 posted"
+        frac_match = re.search(r'(\d+)\s*/\s*(\d+)\s+posted', claim_lower)
+        if frac_match:
+            claimed_posted = int(frac_match.group(1))
+            claimed_total = int(frac_match.group(2))
+            checks.append(("posted", claimed_posted, actual_posted))
+            checks.append(("total", claimed_total, actual_total))
+
+        # Parse "N unposted" format
+        unposted_match = re.search(r'(\d+)\s+unposted', claim_lower)
+        if unposted_match:
+            claimed_unposted = int(unposted_match.group(1))
+            checks.append(("unposted", claimed_unposted, actual_unposted))
+
+        if not checks:
+            if claim.extracted_numbers:
+                claimed = int(claim.extracted_numbers[0])
+                checks.append(("count", claimed, actual_total))
+            else:
+                return VerificationOutcome(
+                    claim=claim, result=VerificationResult.INCONCLUSIVE,
+                    evidence="Could not parse count from Notes claim",
+                    checked_at=now, method="notes_queue_count",
+                )
+
+        evidence_parts = []
+        all_ok = True
+        for label, claimed, actual in checks:
+            ok = claimed == actual
+            if ok:
+                evidence_parts.append(f"  ✓ {label}: {claimed}/{actual}")
+            else:
+                evidence_parts.append(f"  ✗ {label}: claimed {claimed}, actual {actual}")
+                all_ok = False
+
+        evidence = " | ".join(p.strip() for p in evidence_parts)
+        result = VerificationResult.PASSED if all_ok else VerificationResult.FAILED
+        return VerificationOutcome(
+            claim=claim, result=result, evidence=evidence,
+            checked_at=now, method="notes_queue_count",
+            checked_paths=[str(file_path)],
+        )
+    except Exception as e:
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.INCONCLUSIVE,
+            evidence=f"Error parsing notes queue: {e}",
+            checked_at=now, method="notes_queue_count",
+        )
+
+
+def _verify_prediction_resolution(
+    claim: Claim, root: Path, now: str,
+) -> VerificationOutcome:
+    """Verify prediction resolution count claims against the knowledge tree.
+
+    Handles claims like:
+    - "120/470 resolved (25.5%)"
+    - "118/470 resolved"
+
+    Reads KNOWLEDGE_TREE.json directly and counts prediction-tagged entries
+    that have a 'resolution' field populated.
+    """
+    tree_path = root / "core" / "knowledge" / "KNOWLEDGE_TREE.json"
+    if not tree_path.exists():
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.INCONCLUSIVE,
+            evidence="KNOWLEDGE_TREE.json not found",
+            checked_at=now, method="prediction_resolution",
+        )
+
+    try:
+        tree = json.loads(tree_path.read_text())
+        nodes = tree.get("nodes", {})
+
+        # Count prediction-tagged entries
+        pred_nodes = [
+            (k, v) for k, v in nodes.items()
+            if isinstance(v, dict) and "prediction" in str(v.get("tags", ""))
+        ]
+        actual_total = len(pred_nodes)
+        actual_resolved = sum(
+            1 for _, v in pred_nodes if v.get("resolution")
+        )
+
+        claim_lower = claim.text.lower()
+        frac_match = re.search(r'(\d+)\s*/\s*(\d+)\s+resolved', claim_lower)
+
+        if frac_match:
+            claimed_resolved = int(frac_match.group(1))
+            claimed_total = int(frac_match.group(2))
+            tolerance = max(claimed_total * 0.1, 10)
+
+            evidence = (
+                f"  Resolved: claimed {claimed_resolved}/{claimed_total}, "
+                f"actual {actual_resolved}/{actual_total}\n"
+            )
+            resolved_ok = abs(actual_resolved - claimed_resolved) <= tolerance
+            total_ok = abs(actual_total - claimed_total) <= tolerance
+
+            if resolved_ok and total_ok:
+                result = VerificationResult.PASSED
+                evidence += f"  → Counts match (tolerance: ±{int(tolerance)})"
+            else:
+                result = VerificationResult.FAILED
+                evidence += f"  → Count mismatch (tolerance: ±{int(tolerance)})"
+
+            return VerificationOutcome(
+                claim=claim, result=result, evidence=evidence,
+                checked_at=now, method="prediction_resolution",
+            )
+
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.INCONCLUSIVE,
+            evidence="Could not parse resolution fraction from claim",
+            checked_at=now, method="prediction_resolution",
+        )
+    except (json.JSONDecodeError, Exception) as e:
+        return VerificationOutcome(
+            claim=claim, result=VerificationResult.INCONCLUSIVE,
+            evidence=f"Error checking prediction resolution: {e}",
+            checked_at=now, method="prediction_resolution",
         )
 
 
@@ -1378,6 +1589,170 @@ def verify_registry(paths: List[str]) -> VerificationOutcome:
 
 
 # ---------------------------------------------------------------------------
+# Date-expiry and staleness verification
+# ---------------------------------------------------------------------------
+
+# Month name → number mapping for date parsing
+_MONTH_MAP = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+# Patterns for extracting concrete dates from claim text
+_ISO_DATE_RE = re.compile(r'\b(\d{4})-(\d{2})-(\d{2})\b')
+_MONTH_DAY_RE = re.compile(
+    r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+(\d{1,2})\b',
+    re.IGNORECASE,
+)
+
+
+def _parse_date_from_text(text: str) -> Optional[datetime]:
+    """Try to extract a concrete date from claim text.
+
+    Returns a timezone-aware datetime or None.
+    """
+    # Try ISO format first: 2026-03-31
+    m = _ISO_DATE_RE.search(text)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # Try "Mon DD" format: Mar 31, Apr 5
+    m = _MONTH_DAY_RE.search(text)
+    if m:
+        month_num = _MONTH_MAP.get(m.group(1)[:3].lower())
+        day = int(m.group(2))
+        if month_num:
+            # Assume current year
+            year = datetime.now(timezone.utc).year
+            try:
+                return datetime(year, month_num, day, tzinfo=timezone.utc)
+            except ValueError:
+                pass
+
+    return None
+
+
+def verify_date_expiry(claim: Claim) -> VerificationOutcome:
+    """Verify date-expiry claims by checking if the date has passed.
+
+    For claims like "expires Mon Mar 31" or "resolve Apr 5":
+    - If the date has passed → FAILED (claim is stale/actionable)
+    - If the date is today or future → PASSED
+    - If no date can be parsed → INCONCLUSIVE
+    """
+    now = datetime.now(timezone.utc)
+    expiry_date = _parse_date_from_text(claim.text)
+
+    if expiry_date is None:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="Could not parse a concrete date from claim text",
+            checked_at=now.isoformat(),
+            method="date_expiry_check",
+        )
+
+    days_diff = (expiry_date.date() - now.date()).days
+
+    if days_diff < 0:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.FAILED,
+            evidence=f"Date {expiry_date.strftime('%Y-%m-%d')} has passed ({abs(days_diff)} days ago). Claim is stale.",
+            checked_at=now.isoformat(),
+            method="date_expiry_check",
+        )
+    else:
+        label = "today" if days_diff == 0 else f"in {days_diff} day(s)"
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.PASSED,
+            evidence=f"Date {expiry_date.strftime('%Y-%m-%d')} is {label}. Not yet expired.",
+            checked_at=now.isoformat(),
+            method="date_expiry_check",
+        )
+
+
+# Pattern for (verified: YYYY-MM-DD) inline markers
+_VERIFIED_INLINE_RE = re.compile(
+    r'\(verified:?\s*(\d{4}-\d{2}-\d{2})\b',
+    re.IGNORECASE,
+)
+
+# Default; overridden by core.config.VERIFIED_DATE_STALE_DAYS when running inside ia
+try:
+    from core.config import VERIFIED_DATE_STALE_DAYS as _VERIFIED_DATE_STALE_DAYS
+except ImportError:
+    _VERIFIED_DATE_STALE_DAYS = 3
+
+
+def verify_verified_date_staleness(claim: Claim) -> VerificationOutcome:
+    """Check if a (verified: YYYY-MM-DD) marker is stale.
+
+    Looks at the extracted_numbers field (which contains the date string
+    from the VERIFIED_DATE_RE match) or parses from claim text.
+    """
+    now = datetime.now(timezone.utc)
+    date_str = None
+
+    # The date is stored in extracted_numbers by the extractor
+    if claim.extracted_numbers:
+        for num in claim.extracted_numbers:
+            if re.match(r'\d{4}-\d{2}-\d{2}$', num):
+                date_str = num
+                break
+
+    # Fallback: parse from text
+    if not date_str:
+        m = _VERIFIED_INLINE_RE.search(claim.text)
+        if m:
+            date_str = m.group(1)
+
+    if not date_str:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="No verified date found in claim",
+            checked_at=now.isoformat(),
+            method="verified_date_staleness",
+        )
+
+    try:
+        verified_date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence=f"Could not parse date: {date_str}",
+            checked_at=now.isoformat(),
+            method="verified_date_staleness",
+        )
+
+    days_old = (now.date() - verified_date.date()).days
+
+    if days_old > _VERIFIED_DATE_STALE_DAYS:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.FAILED,
+            evidence=f"Verified date {date_str} is {days_old} days old (threshold: {_VERIFIED_DATE_STALE_DAYS} days). Data may be stale.",
+            checked_at=now.isoformat(),
+            method="verified_date_staleness",
+        )
+    else:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.PASSED,
+            evidence=f"Verified date {date_str} is {days_old} day(s) old (within {_VERIFIED_DATE_STALE_DAYS}-day threshold).",
+            checked_at=now.isoformat(),
+            method="verified_date_staleness",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main verification dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1462,6 +1837,16 @@ def verify_claim(claim: Claim) -> VerificationOutcome:
         outcome = verify_count(claim)
         if outcome.result != VerificationResult.INCONCLUSIVE:
             return outcome
+
+    # Date-expiry claims — check if the date has passed
+    if claim.claim_type == ClaimType.DATE_EXPIRY:
+        return verify_date_expiry(claim)
+
+    # Verified-date staleness — check (verified: YYYY-MM-DD) markers
+    if (claim.claim_type == ClaimType.FACT_CLAIM
+            and claim.extracted_numbers
+            and any(re.match(r'\d{4}-\d{2}-\d{2}$', n) for n in claim.extracted_numbers)):
+        return verify_verified_date_staleness(claim)
 
     # Semi-verifiable claims without enough context for auto-verification
     if claim.verifiability == VerifiabilityLevel.SEMI:

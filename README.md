@@ -73,8 +73,19 @@ pip install -e ./confab-framework
 
 ## Quick Start
 
+### Scan any markdown (no config needed)
+
 ```bash
 pip install confab-framework
+confab scan path/to/handoff.md     # extract + verify claims in any file
+confab scan docs/                  # scan all .md files in a directory
+```
+
+This works on any markdown — no `confab.toml` required. Claims referencing files are resolved relative to your current directory.
+
+### Full project setup
+
+```bash
 cd your-project/
 confab init                        # generate a confab.toml
 # Edit confab.toml — add your priority/handoff files to files_to_scan
@@ -128,6 +139,57 @@ Options: `check_files=True`, `check_env=True` to control what gets verified.
 
 See `examples/middleware_example.py` for a complete walkthrough.
 
+### Framework Integrations
+
+Install with the integration you need:
+
+```bash
+pip install confab-framework[langchain]   # LangChain
+pip install confab-framework[crewai]      # CrewAI
+pip install confab-framework[autogen]     # AutoGen v0.4+
+```
+
+**LangChain** — callback handler that verifies agent output at each step:
+
+```python
+from confab.integrations.langchain import ConfabCallbackHandler
+
+handler = ConfabCallbackHandler(on_fail="warn")
+llm = ChatOpenAI(callbacks=[handler])
+
+# After execution:
+print(handler.summary())   # "confab: 0 failures in 3 claims"
+assert handler.clean       # True if no failures
+```
+
+**CrewAI** — task callback that checks output after each task:
+
+```python
+from confab.integrations.crewai import ConfabTaskCallback
+
+cb = ConfabTaskCallback(on_fail="warn")
+task = Task(description="...", agent=agent, callback=cb)
+
+# After crew runs:
+print(cb.summary())
+```
+
+**AutoGen** — intervention handler that intercepts agent responses at runtime:
+
+```python
+from confab.integrations.autogen import ConfabInterventionHandler
+
+handler = ConfabInterventionHandler(on_fail="drop")  # drop = filter bad claims
+runtime = SingleThreadedAgentRuntime(
+    intervention_handlers=[handler]
+)
+
+# After execution:
+print(handler.summary())
+```
+
+All integrations share the same interface: `check_files`, `check_env`, `check_counts` toggles, `on_fail` mode (`"warn"`, `"raise"`, `"log"`, and `"drop"` for AutoGen), plus `.reports`, `.last_report`, `.clean`, `.summary()`, and `.clear()`.
+
 ### Standalone text verification
 
 ```python
@@ -143,7 +205,21 @@ print(report.summary())
 
 Agents in multi-agent systems pass claims forward at handoff points — "the pipeline is blocked on X," "file Y exists," "the config is ready." When an agent states a falsehood confidently, the next agent copies it forward. The confab framework breaks this cascade by extracting claims from handoff text, auto-verifying them against reality (filesystem, environment variables, script syntax, config parsing, pipeline outputs), and tracking how long unverified claims persist. Claims that fail verification get flagged; claims that linger without verification get marked stale. The gate runs at every agent handoff point, supplying the oracle bits that distinguish confabulation from understanding.
 
-The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiability) → **Verify** (check against ground truth) → **Track** (SQLite persistence across runs) → **Report** (failures + staleness + tree health).
+The pipeline: **Extract** (scan for claims) → **Classify** (type + verifiability) → **Score** (confidence 0.0–1.0) → **Verify** (check against ground truth) → **Track** (SQLite persistence across runs) → **Report** (failures + staleness + tree health).
+
+### Confidence Scoring
+
+Every extracted claim gets a confidence score (0.0–1.0) reflecting how certain the extractor is that the text is a verifiable claim and that the classification is correct:
+
+```python
+from confab import extract_claims
+
+claims = extract_claims(agent_output)
+for c in claims:
+    print(f"[{c.confidence:.2f}] {c.claim_type.value}: {c.text[:60]}")
+```
+
+Scoring factors: specificity of extracted artifacts (paths, env vars), verifiability level (AUTO > SEMI > MANUAL), claim type signal strength, existing verification tags, and age penalty for stale unverified claims. Use confidence to prioritize which claims to verify first or to filter low-confidence noise.
 
 ### Assertion Context Detection
 
@@ -161,6 +237,7 @@ This avoids false positives from documentation, comments, and references while c
 | `confab check "text"` | Check inline text for claims |
 | `confab extract file.md` | Extract claims without verifying |
 | `confab quick` | One-line gate summary (for scripts and prompts) |
+| `confab scan <files>` | Scan arbitrary markdown files for claims — extract + verify |
 | `confab init` | Generate a starter `confab.toml` in the current directory |
 
 ### Hygiene
@@ -363,6 +440,19 @@ The demo shows:
 2. **Auto-verification** catching false file/env claims before they cascade
 3. **Cascade tracking** — how unverified claims age across builds
 4. **High-level API** usage with `ConfabGate` and `ConfabConfig`
+
+### Scanning any markdown file
+
+Use `confab scan` to extract and verify claims from any markdown file — not limited to files in your `confab.toml`:
+
+```bash
+confab scan docs/README.md notes/handoff.md    # scan multiple files
+confab scan docs/*.md                          # glob patterns work
+confab scan docs/priorities.md --no-verify     # extract claims only, skip verification
+confab scan docs/priorities.md --json          # machine-readable output
+```
+
+This is useful for one-off checks on files outside your normal gate pipeline.
 
 ### Checking claims in a handoff file
 
