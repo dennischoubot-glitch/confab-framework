@@ -40,9 +40,9 @@ confab = "confab.cli:main"
 packages = ["confab", "confab.examples", "confab.integrations"]
 
 [tool.setuptools.package-dir]
-confab = "."
-"confab.examples" = "examples"
-"confab.integrations" = "integrations"
+confab = "confab"
+"confab.examples" = "confab/examples"
+"confab.integrations" = "confab/integrations"
 
 [tool.setuptools.package-data]
 confab = ["*.md", "*.html", "*.toml", "LICENSE"]
