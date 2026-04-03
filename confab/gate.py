@@ -67,7 +67,7 @@ try:
         raise FileNotFoundError
 except (FileNotFoundError, ImportError, AttributeError):
     STALE_BUILD_THRESHOLD = 3
-    PST = "America/Los_Angeles"
+    PST = ZoneInfo("America/Los_Angeles")
     RESPONDER_DAILY_REPLY_LIMIT = 15
     RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 1
 
