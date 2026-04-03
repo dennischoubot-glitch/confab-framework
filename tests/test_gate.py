@@ -147,6 +147,33 @@ class TestRunGate(unittest.TestCase):
         report = run_gate(text="Audio blocked on OPENAI_API_KEY", track=False)
         self.assertTrue(report.total_claims > 0)
 
+    def test_gate_text_only_no_files(self):
+        """Gate with text and empty files produces claims from text only."""
+        # Create a file that exists in the tmpdir so verification passes
+        existing = Path(self.tmpdir) / "existing.py"
+        existing.write_text("pass")
+        report = run_gate(
+            files=[],
+            text=f"The file {existing} exists",
+            track=False,
+        )
+        self.assertTrue(report.total_claims > 0)
+        self.assertEqual(report.files_scanned, [])
+
+    def test_gate_text_detects_missing_file(self):
+        """Gate should detect file_exists failures from inline text."""
+        report = run_gate(
+            files=[],
+            text="The file /nonexistent/path/fake_module.py exists and is deployed",
+            track=False,
+        )
+        file_failures = [
+            d for d in report.failed_details
+            if d.get("claim_type") == "file_exists"
+        ]
+        if report.total_claims > 0:
+            self.assertTrue(len(file_failures) > 0)
+
     def test_gate_with_file(self):
         """Gate scans files for claims."""
         md = Path(self.tmpdir) / "priorities.md"

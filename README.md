@@ -1,5 +1,10 @@
 # confab-framework
 
+[![PyPI version](https://img.shields.io/pypi/v/confab-framework)](https://pypi.org/project/confab-framework/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://pypi.org/project/confab-framework/)
+[![Tests: 679 passing](https://img.shields.io/badge/tests-679%20passing-brightgreen.svg)](https://github.com/dennischoubot-glitch/confab-framework)
+
 Structural confabulation detection and prevention for multi-agent systems.
 
 Agents state falsehoods confidently. Other agents copy them forward indefinitely. This framework makes verification structural (enforced by code) rather than aspirational (suggested by docs).
@@ -147,6 +152,8 @@ Install with the integration you need:
 pip install confab-framework[langchain]   # LangChain
 pip install confab-framework[crewai]      # CrewAI
 pip install confab-framework[autogen]     # AutoGen v0.4+
+pip install confab-framework[agent-sdk]   # Claude Agent SDK
+pip install confab-framework[openai-agents] # OpenAI Agents SDK
 ```
 
 **LangChain** — callback handler that verifies agent output at each step:
@@ -188,7 +195,85 @@ runtime = SingleThreadedAgentRuntime(
 print(handler.summary())
 ```
 
-All integrations share the same interface: `check_files`, `check_env`, `check_counts` toggles, `on_fail` mode (`"warn"`, `"raise"`, `"log"`, and `"drop"` for AutoGen), plus `.reports`, `.last_report`, `.clean`, `.summary()`, and `.clear()`.
+**Claude Agent SDK** — PostToolUse hook that verifies claims in tool output:
+
+```python
+from claude_agent_sdk import query, ClaudeAgentOptions, HookMatcher
+from confab.integrations.agent_sdk import ConfabPostToolUseHook
+
+hook = ConfabPostToolUseHook(on_fail="inject")  # inject = warn the agent in-context
+options = ClaudeAgentOptions(
+    hooks={"PostToolUse": [HookMatcher(hooks=[hook])]},
+)
+
+async for message in query(prompt="...", options=options):
+    pass
+
+print(hook.summary())
+```
+
+Or verify messages during iteration:
+
+```python
+from confab.integrations.agent_sdk import ConfabMessageVerifier
+
+verifier = ConfabMessageVerifier(on_fail="warn")
+async for message in query(prompt="...", options=options):
+    verifier.verify(message)
+
+assert verifier.clean
+```
+
+**OpenAI Agents SDK** — output guardrail that verifies claims before they leave the agent:
+
+```python
+from agents import Agent, Runner
+from confab.integrations.openai_agents import ConfabOutputGuardrail
+
+guardrail = ConfabOutputGuardrail(on_fail="tripwire")  # tripwire = halt on bad claims
+agent = Agent(
+    name="analyst",
+    instructions="Check system health",
+    output_guardrails=[guardrail],
+)
+
+result = await Runner.run(agent, "Check status")
+print(guardrail.summary())
+```
+
+Or verify run results after execution:
+
+```python
+from confab.integrations.openai_agents import ConfabRunVerifier
+
+verifier = ConfabRunVerifier(on_fail="warn")
+result = await Runner.run(agent, "Check status")
+verifier.verify(result)
+
+assert verifier.clean
+```
+
+All integrations share the same interface: `check_files`, `check_env`, `check_counts` toggles, `on_fail` mode (`"warn"`, `"raise"`, `"log"`, plus `"drop"` for AutoGen, `"inject"` for Agent SDK, and `"tripwire"` for OpenAI Agents SDK), plus `.reports`, `.last_report`, `.clean`, `.summary()`, and `.clear()`.
+
+**Claude Code** — shell hook for real-time verification during Claude Code sessions:
+
+```json
+{
+  "hooks": {
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "confab hook",
+        "timeout": 10
+      }]
+    }]
+  }
+}
+```
+
+Add this to `.claude/settings.json`. When Claude finishes a response, the hook reads the session transcript, extracts claims, and injects warnings about any that fail verification. No code changes needed — works with any Claude Code project.
+
+See [`examples/claude_code_hooks.md`](examples/claude_code_hooks.md) for PostToolUse configuration and details.
 
 ### Standalone text verification
 
@@ -249,6 +334,14 @@ This avoids false positives from documentation, comments, and references while c
 | `confab sweep --stats` | Tracker statistics |
 | `confab prune` | Identify stale build sections to remove |
 
+### Remediation
+
+| Command | Description |
+|---------|-------------|
+| `confab fix` | Auto-fix stale and failed claims — re-verify, update tags, delete dead lines |
+| `confab triage` | Rank all issues by severity, suggest fixes, enable batch operations |
+| `confab quarantine` | Auto-quarantine claims persisting 5+ gate runs without verification |
+
 ### Diagnostics (Knowledge Tree)
 
 | Command | Description |
@@ -264,6 +357,12 @@ This avoids false positives from documentation, comments, and references while c
 | `confab trace "text"` | Trace propagation path of a specific claim across gate runs |
 | `confab cascade` | Show cascade depth statistics — how far claims propagate |
 | `confab audit` | Comprehensive audit: claims, cascades, resolution rate |
+
+### Claude Code Hooks
+
+| Command | Description |
+|---------|-------------|
+| `confab hook` | Process Claude Code hook events from stdin — real-time verification |
 
 ### CI
 
@@ -584,7 +683,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run confab gate
         id: gate
-        uses: dennischoubot-glitch/confab-framework@v0.8.0
+        uses: dennischoubot-glitch/confab-framework@v1.6.0
         with:
           config: confab.toml
           strict: true

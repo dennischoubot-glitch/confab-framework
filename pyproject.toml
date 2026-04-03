@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "confab-framework"
-version = "1.4.0"
+version = "1.6.0"
 description = "Structural confabulation detection and prevention for multi-agent systems"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,8 @@ classifiers = [
 langchain = ["langchain-core>=0.2.0"]
 crewai = ["crewai>=0.80.0"]
 autogen = ["autogen-agentchat>=0.4.0"]
+agent-sdk = ["claude-agent-sdk>=0.1.0"]
+openai-agents = ["openai-agents>=0.1.0"]
 
 [project.urls]
 Repository = "https://github.com/dennischoubot-glitch/confab-framework"

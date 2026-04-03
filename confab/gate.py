@@ -51,25 +51,25 @@ from .verify import (
 )
 
 # Import operational constants from centralized config (core/config.py)
-# Uses importlib.util to work both as package import and standalone script.
-# Falls back to defaults when running outside the ia workspace.
-import importlib.util as _ilu
-_cfg_path = Path(__file__).resolve().parent.parent / "config.py"
+# Falls back to sensible defaults when installed standalone (outside ia workspace)
 try:
-    _spec = _ilu.spec_from_file_location("ia_config", str(_cfg_path))
-    _cfg = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_cfg)
-    STALE_BUILD_THRESHOLD = _cfg.STALE_CLAIM_BUILD_THRESHOLD
-    PST = _cfg.TIMEZONE
-    RESPONDER_DAILY_REPLY_LIMIT = _cfg.SUBSTACK_DAILY_REPLY_LIMIT
-    RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = _cfg.SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT
-except (FileNotFoundError, AttributeError, TypeError):
-    # Standalone mode — ia config not available, use sensible defaults
-    import zoneinfo
+    import importlib.util as _ilu
+    _cfg_path = Path(__file__).resolve().parent.parent / "config.py"
+    if _cfg_path.exists():
+        _spec = _ilu.spec_from_file_location("ia_config", str(_cfg_path))
+        _cfg = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_cfg)
+        STALE_BUILD_THRESHOLD = _cfg.STALE_CLAIM_BUILD_THRESHOLD
+        PST = _cfg.TIMEZONE
+        RESPONDER_DAILY_REPLY_LIMIT = _cfg.SUBSTACK_DAILY_REPLY_LIMIT
+        RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = _cfg.SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT
+    else:
+        raise FileNotFoundError
+except (FileNotFoundError, ImportError, AttributeError):
     STALE_BUILD_THRESHOLD = 3
-    PST = zoneinfo.ZoneInfo("America/Los_Angeles")
-    RESPONDER_DAILY_REPLY_LIMIT = 30
-    RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 2
+    PST = "America/Los_Angeles"
+    RESPONDER_DAILY_REPLY_LIMIT = 15
+    RESPONDER_DAILY_ORIGINAL_NOTE_LIMIT = 1
 
 
 def check_journal_cadence() -> Dict[str, Any]:
@@ -667,6 +667,7 @@ def _classify_stale_drift(
 def run_gate(
     files: Optional[List[str]] = None,
     text: Optional[str] = None,
+    text_source: str = "<inline>",
     stale_threshold: int = STALE_BUILD_THRESHOLD,
     track: bool = True,
     volatility: Optional[float] = None,
@@ -677,6 +678,8 @@ def run_gate(
         files: List of file paths to scan (relative to workspace or absolute).
                Defaults to builder_priorities.md and dreamer_priorities.md.
         text: Additional text to scan for claims.
+        text_source: Source tag for text claims (default "<inline>",
+                     use "<handoff>" for dreamer→builder handoff text).
         stale_threshold: Number of build sections after which unverified claims are flagged.
         track: Whether to record this run in the persistent tracker DB.
         volatility: Environmental volatility (0.0–1.0). Adjusts stale_threshold
@@ -719,7 +722,7 @@ def run_gate(
 
     # Extract claims from text
     if text:
-        text_claims = extract_claims(text, source_file="<inline>")
+        text_claims = extract_claims(text, source_file=text_source)
         all_claims.extend(text_claims)
 
     # Run verification

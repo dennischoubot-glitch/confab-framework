@@ -178,7 +178,11 @@ def cmd_gate(args):
     """Run the cascade gate."""
     files = [args.file] if args.file else None
     vol = parse_volatility(getattr(args, 'volatility', None))
-    report = run_gate(files=files, volatility=vol)
+    text = getattr(args, 'text', None)
+    if text == "-":
+        import sys as _sys
+        text = _sys.stdin.read()
+    report = run_gate(files=files, text=text, volatility=vol)
 
     if args.json and not getattr(args, 'quarantine', False):
         print(json.dumps(report.to_dict(), indent=2))
@@ -995,6 +999,10 @@ Examples:
     # gate
     gate_parser = subparsers.add_parser("gate", help="Run the cascade gate")
     gate_parser.add_argument("--file", "-f", help="Specific file to scan")
+    gate_parser.add_argument(
+        "--text", "-t",
+        help="Additional text to scan for claims (use '-' to read from stdin)",
+    )
     gate_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     gate_parser.add_argument(
         "--volatility", "-V",
@@ -1168,6 +1176,17 @@ Examples:
     scan_parser.add_argument("--no-verify", action="store_true",
                              help="Extract claims only, skip verification")
 
+    # hook — Claude Code hooks integration
+    hook_parser = subparsers.add_parser(
+        "hook",
+        help="Process Claude Code hook events (reads JSON from stdin)",
+    )
+    hook_parser.add_argument(
+        "--event", choices=["Stop", "PostToolUse"],
+        help="Override event type (auto-detected from stdin JSON)",
+    )
+    hook_parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+
     # init — generate a starter confab.toml
     init_parser = subparsers.add_parser("init", help="Generate a starter confab.toml in the current directory")
 
@@ -1221,6 +1240,8 @@ Examples:
         cmd_fix_expired(args)
     elif args.command == "scan":
         cmd_scan(args)
+    elif args.command == "hook":
+        cmd_hook(args)
     elif args.command == "init":
         cmd_init(args)
     else:
@@ -2240,6 +2261,162 @@ def cmd_fix_expired(args):
         sys.exit(0)
     elif result.expired_count > 0 and result.dry_run:
         sys.exit(1)  # Signal there's work to do
+
+
+def cmd_hook(args):
+    """Process Claude Code hook events for real-time confabulation detection.
+
+    Reads a Claude Code hook JSON payload from stdin, extracts text from the
+    event (agent output for Stop, file content for PostToolUse on Write/Edit),
+    runs claim extraction + verification, and returns a hook response JSON.
+
+    Usage in .claude/settings.json:
+        {
+          "hooks": {
+            "Stop": [
+              {
+                "hooks": [{
+                  "type": "command",
+                  "command": "confab hook"
+                }]
+              }
+            ]
+          }
+        }
+    """
+    import io
+
+    # Read hook event JSON from stdin
+    raw = sys.stdin.read().strip()
+    if not raw:
+        # No input — exit cleanly (no-op)
+        sys.exit(0)
+
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        print("confab hook: invalid JSON on stdin", file=sys.stderr)
+        sys.exit(1)  # non-blocking error
+
+    event_name = args.event or event.get("hook_event_name", "")
+    tool_name = event.get("tool_name", "")
+
+    # Extract text to verify based on event type
+    text_to_check = ""
+
+    if event_name == "Stop":
+        # Read the transcript to extract agent output
+        transcript_path = event.get("transcript_path", "")
+        if transcript_path and Path(transcript_path).exists():
+            text_to_check = _extract_transcript_text(transcript_path)
+        # If no transcript, nothing to check
+        if not text_to_check:
+            sys.exit(0)
+
+    elif event_name == "PostToolUse":
+        tool_input = event.get("tool_input", {})
+        if tool_name in ("Write", "Edit"):
+            # Check content being written
+            content = tool_input.get("content", "")
+            new_string = tool_input.get("new_string", "")
+            text_to_check = content or new_string
+        elif tool_name == "Bash":
+            # Check command output for claims
+            tool_response = event.get("tool_response", {})
+            if isinstance(tool_response, dict):
+                text_to_check = tool_response.get("stdout", "")
+            elif isinstance(tool_response, str):
+                text_to_check = tool_response
+    else:
+        # Unknown event — exit cleanly
+        sys.exit(0)
+
+    if not text_to_check or len(text_to_check.strip()) < 20:
+        # Too short to contain verifiable claims
+        sys.exit(0)
+
+    # Extract and verify claims
+    claims = extract_claims(text_to_check, source_file="<claude-code-hook>")
+    if not claims:
+        sys.exit(0)
+
+    outcomes = verify_all(claims)
+
+    # Filter to failures only
+    failures = [o for o in outcomes if o.result.value == "failed"]
+
+    if not failures:
+        # All claims passed or inconclusive — no action needed
+        sys.exit(0)
+
+    # Build warning message for Claude
+    warning_lines = [
+        f"Confab detected {len(failures)} potentially confabulated claim(s):",
+    ]
+    for o in failures:
+        warning_lines.append(
+            f"  - [{o.claim.claim_type.value}] {o.claim.text[:120]}"
+        )
+        if o.evidence:
+            for line in o.evidence.strip().split("\n")[:2]:
+                warning_lines.append(f"    {line.strip()}")
+
+    warning_lines.append(
+        "\nVerify these claims before proceeding. Use file reads or web search to confirm."
+    )
+    warning_text = "\n".join(warning_lines)
+
+    # Return Claude Code hook response
+    response = {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": warning_text,
+        }
+    }
+
+    print(json.dumps(response))
+    sys.exit(0)
+
+
+def _extract_transcript_text(transcript_path: str, max_lines: int = 50) -> str:
+    """Extract recent assistant text from a Claude Code transcript file.
+
+    The transcript is a JSONL file. We read the last N lines and extract
+    text content from assistant messages.
+    """
+    path = Path(transcript_path)
+    if not path.exists():
+        return ""
+
+    try:
+        lines = path.read_text().strip().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+    # Read last max_lines entries
+    recent = lines[-max_lines:] if len(lines) > max_lines else lines
+
+    text_parts = []
+    for line in recent:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        # Look for assistant messages with text content
+        role = entry.get("role", "")
+        if role != "assistant":
+            continue
+
+        content = entry.get("content", [])
+        if isinstance(content, str):
+            text_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+
+    return "\n".join(text_parts)
 
 
 def cmd_init(args):

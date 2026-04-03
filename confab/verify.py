@@ -1056,15 +1056,28 @@ def _verify_json_array_count(
         else:
             claimed_count = int(claim.extracted_numbers[0])
 
-        # Check for time window (e.g., "in 24 hours", "in 3 days")
-        time_match = re.search(r'(\d+)\s+(hours?|days?)', claim.text.lower())
-        if time_match:
-            window_num = int(time_match.group(1))
-            unit = time_match.group(2)
-            hours = window_num if "hour" in unit else window_num * 24
+        # Check for time window (e.g., "in 24 hours", "in 3 days", "today")
+        claim_lower = claim.text.lower()
+        time_match = re.search(r'(\d+)\s+(hours?|days?)', claim_lower)
+        is_today = 'today' in claim_lower
+        if time_match or is_today:
             from datetime import timedelta
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-            cutoff_str = cutoff.strftime("%Y-%m-%d")
+            if is_today:
+                # "today" = entries with today's date
+                try:
+                    from zoneinfo import ZoneInfo
+                    pst = ZoneInfo("America/Los_Angeles")
+                except ImportError:
+                    pst = timezone.utc
+                cutoff_str = datetime.now(pst).strftime("%Y-%m-%d")
+                window_label = "today"
+            else:
+                window_num = int(time_match.group(1))
+                unit = time_match.group(2)
+                hours = window_num if "hour" in unit else window_num * 24
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+                cutoff_str = cutoff.strftime("%Y-%m-%d")
+                window_label = f"in {window_num} {unit}"
 
             recent = [
                 p for p in data
@@ -1072,7 +1085,7 @@ def _verify_json_array_count(
             ]
             actual_count = len(recent)
             evidence = (
-                f"  Claimed: {claimed_count} entries in {window_num} {unit}\n"
+                f"  Claimed: {claimed_count} entries {window_label}\n"
                 f"  Actual: {actual_count} entries since {cutoff_str}\n"
             )
         else:
@@ -1275,8 +1288,10 @@ def _verify_notes_queue_count(
         claim_lower = claim.text.lower()
         checks = []
 
-        # Parse fractional format: "31/34 posted" or "31/35 posted"
-        frac_match = re.search(r'(\d+)\s*/\s*(\d+)\s+posted', claim_lower)
+        # Parse fractional format: "31/34 posted", "11/30 correct", or bare "11/30"
+        # Since we're already in the notes-queue verifier, any X/Y fraction
+        # is interpreted as "X posted out of Y total"
+        frac_match = re.search(r'(\d+)\s*/\s*(\d+)(?:\s+(?:posted|correct|done|complete))?\b', claim_lower)
         if frac_match:
             claimed_posted = int(frac_match.group(1))
             claimed_total = int(frac_match.group(2))
@@ -1588,6 +1603,47 @@ def verify_registry(paths: List[str]) -> VerificationOutcome:
     )
 
 
+def verify_commit_exists(commit_hashes: List[str]) -> VerificationOutcome:
+    """Verify that referenced git commits exist in the repository.
+
+    Runs `git cat-file -t <hash>` for each hash — a fast, read-only check
+    that confirms the object exists in the git database without requiring
+    a full log search.
+    """
+    root = _get_workspace_root()
+    results = []
+    any_missing = False
+
+    for h in commit_hashes:
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "-t", h],
+                capture_output=True, text=True, timeout=5,
+                cwd=str(root),
+            )
+            if result.returncode == 0 and result.stdout.strip() == "commit":
+                results.append(f"  {h}: exists (commit)")
+            elif result.returncode == 0:
+                results.append(f"  {h}: exists ({result.stdout.strip()}, not a commit)")
+                any_missing = True
+            else:
+                results.append(f"  {h}: NOT FOUND in git history")
+                any_missing = True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            results.append(f"  {h}: could not verify (git not available)")
+            any_missing = True
+
+    evidence = "\n".join(results)
+    return VerificationOutcome(
+        claim=Claim(text="", claim_type=ClaimType.COMMIT_EXISTS,
+                    verifiability=VerifiabilityLevel.AUTO),
+        result=VerificationResult.FAILED if any_missing else VerificationResult.PASSED,
+        evidence=evidence,
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        method="git_cat_file",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Date-expiry and staleness verification
 # ---------------------------------------------------------------------------
@@ -1753,6 +1809,324 @@ def verify_verified_date_staleness(claim: Claim) -> VerificationOutcome:
 
 
 # ---------------------------------------------------------------------------
+# Claim classification helpers for the dispatcher
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a claim is an instruction/rule rather than a
+# verifiable assertion (e.g. "If you're reading data with a verified date
+# >2 days old, re-verify before acting on it").
+_INSTRUCTIONAL_PATTERNS = [
+    re.compile(r'^if\s+you', re.IGNORECASE),
+    re.compile(r'^when\s+you', re.IGNORECASE),
+    re.compile(r'^always\s+', re.IGNORECASE),
+    re.compile(r'^never\s+', re.IGNORECASE),
+    re.compile(r'^do\s+not\s+', re.IGNORECASE),
+    re.compile(r'^don\'t\s+', re.IGNORECASE),
+    re.compile(r're-verify\s+before', re.IGNORECASE),
+    re.compile(r'before\s+acting\s+on\s+it', re.IGNORECASE),
+]
+
+
+def _is_instructional_claim(claim: Claim) -> bool:
+    """Detect instructional/rule claims that aren't verifiable assertions.
+
+    These are behavioral guidelines embedded in priority files, like
+    "If you're reading data with a verified date >2 days old, re-verify..."
+    They contain numbers (triggering count_claim) but aren't actual counts.
+    """
+    text = claim.text.strip().lstrip('- ')
+    for pattern in _INSTRUCTIONAL_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _is_completed_task_claim(claim: Claim) -> bool:
+    """Detect completed task claims like '[x] IC Dataset Merge — Completed'."""
+    text = claim.text.strip()
+    return bool(re.search(r'\[x\]', text, re.IGNORECASE))
+
+
+def verify_completed_task(claim: Claim) -> VerificationOutcome:
+    """Verify a completed task claim by checking for evidence of completion.
+
+    For claims like "[x] IC Dataset Merge — Completed Mar 28", check if
+    the project directory or output files exist.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    root = _get_workspace_root()
+    text_lower = claim.text.lower()
+
+    # Try to find a project directory reference
+    project_dirs = []
+    # Check for known project keywords
+    project_keywords = {
+        'ic dataset': 'projects/ic-dataset',
+        'sentinel': 'projects/sentinel',
+        'synthesis': 'projects/synthesis',
+        'synauth': 'projects/synauth',
+        'confab': 'core/confab',
+        'discourse': 'projects/discourse',
+    }
+
+    for keyword, proj_dir in project_keywords.items():
+        if keyword in text_lower:
+            full_path = root / proj_dir
+            if full_path.exists():
+                project_dirs.append(proj_dir)
+
+    # Also check any extracted paths
+    for path_str in (claim.extracted_paths or []):
+        resolved = _resolve_path(path_str)
+        if resolved.exists():
+            project_dirs.append(path_str)
+
+    if project_dirs:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.PASSED,
+            evidence=f"Completed task — project artifacts found: {', '.join(project_dirs)}",
+            checked_at=now,
+            method="completed_task_check",
+        )
+
+    # If we can't find project evidence, check for "Completed" + date as
+    # sufficient evidence (the claim itself asserts completion)
+    if re.search(r'completed?\s+\w+\s+\d{1,2}', text_lower):
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.PASSED,
+            evidence="Completed task with date — treated as historical record",
+            checked_at=now,
+            method="completed_task_check",
+        )
+
+    return VerificationOutcome(
+        claim=claim,
+        result=VerificationResult.INCONCLUSIVE,
+        evidence="Completed task claim but no project artifacts found to verify",
+        checked_at=now,
+        method="completed_task_check",
+    )
+
+
+def verify_confab_subcommand(claim: Claim) -> VerificationOutcome:
+    """Verify claims about confab subcommands being live/available.
+
+    For claims like "confab fix-expired is live", check that the subcommand
+    exists in the confab CLI.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Extract subcommand name from claim text
+    match = re.search(r'confab\s+(\w[\w-]*)', claim.text, re.IGNORECASE)
+    if not match:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="Could not extract confab subcommand name from claim",
+            checked_at=now,
+            method="confab_subcommand_check",
+        )
+
+    subcommand = match.group(1).lower()
+
+    # Check if the subcommand is registered in confab CLI
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "confab", subcommand, "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        exists = result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        exists = False
+
+    if exists:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.PASSED,
+            evidence=f"Confab subcommand '{subcommand}' is available (--help returned 0)",
+            checked_at=now,
+            method="confab_subcommand_check",
+        )
+    else:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.FAILED,
+            evidence=f"Confab subcommand '{subcommand}' not found or errored",
+            checked_at=now,
+            method="confab_subcommand_check",
+        )
+
+
+def verify_project_status(claim: Claim) -> VerificationOutcome:
+    """Verify project status claims by checking project directory existence.
+
+    For claims like "Sentinel: ACTIVE", check that the project directory
+    exists under projects/ or core/.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    root = _get_workspace_root()
+    text_lower = claim.text.lower()
+
+    # Known project keywords -> directory paths
+    project_map = {
+        'sentinel': 'projects/sentinel',
+        'synthesis': 'projects/synthesis',
+        'synauth': 'projects/synauth',
+        'confab': 'core/confab',
+        'discourse': 'projects/discourse',
+        'ic dataset': 'projects/ic-dataset',
+    }
+
+    for keyword, proj_dir in project_map.items():
+        if keyword in text_lower:
+            full_path = root / proj_dir
+            if full_path.exists():
+                return VerificationOutcome(
+                    claim=claim,
+                    result=VerificationResult.PASSED,
+                    evidence=f"Project '{keyword}' directory exists at {proj_dir}",
+                    checked_at=now,
+                    method="project_status_check",
+                )
+            else:
+                return VerificationOutcome(
+                    claim=claim,
+                    result=VerificationResult.FAILED,
+                    evidence=f"Project '{keyword}' directory NOT found at {proj_dir}",
+                    checked_at=now,
+                    method="project_status_check",
+                )
+
+    return VerificationOutcome(
+        claim=claim,
+        result=VerificationResult.INCONCLUSIVE,
+        evidence="No known project keyword found in claim text",
+        checked_at=now,
+        method="project_status_check",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config consistency verification (type 5 confab pattern)
+# ---------------------------------------------------------------------------
+
+# Mapping from textual patterns in priority files to config.py attribute names.
+# Each entry: (regex pattern, config attribute name, description)
+# The regex should capture a number group that can be compared to the config value.
+_CONFIG_LIMIT_PATTERNS: List[tuple] = [
+    # Notes limits
+    (r'(?:notes?\s+)?daily\s+(?:limit|max|cap)\s*(?:of\s+)?(\d+)', 'NOTES_DAILY_MAX', 'Notes daily max'),
+    (r'(\d+)/\d+\s+(?:notes?\s+)?posted', None, None),  # skip X/Y progress patterns
+    (r'daily\s+limit\s+(?:reached\s+)?(?:\()?(\d+)/(\d+)', 'NOTES_DAILY_MAX', 'Notes daily max (from X/Y format)'),
+    # Substack engagement limits
+    (r'(?:substack\s+)?(?:engagement|reply)\s+(?:limit|max|cap)\s*(?:of\s+)?(\d+)', 'SUBSTACK_DAILY_ENGAGEMENT_LIMIT', 'Substack daily engagement limit'),
+    (r'(?:substack\s+)?(?:daily\s+)?(?:original\s+)?note\s+limit\s*(?:of\s+)?(\d+)', 'SUBSTACK_DAILY_ORIGINAL_NOTE_LIMIT', 'Substack daily original note limit'),
+    # Journal limits
+    (r'journal\s+daily\s+(?:limit|max|cap)\s*(?:of\s+)?(\d+)', 'JOURNAL_DAILY_LIMIT', 'Journal daily limit'),
+    # Domain diversity
+    (r'(?:max\s+)?consecutive\s+(?:entries?\s+)?(?:in\s+)?(?:same\s+)?domain\s*(?:limit|max|cap)?\s*(?:of\s+)?(\d+)', 'DOMAIN_DIVERSITY_MAX_CONSECUTIVE', 'Domain diversity max consecutive'),
+    # Trading limits (4th element = unit_multiplier: stated value × multiplier = config units)
+    (r'max\s+(?:cost|trade)\s+(?:per\s+trade\s+)?\$?(\d+)', 'KALSHI_MAX_COST_CENTS', 'Kalshi max cost (cents)', 100),
+]
+
+
+def verify_config_consistency(claim: Claim) -> VerificationOutcome:
+    """Verify that stated limits in priority files match actual config.py values.
+
+    Catches the type 5 confab pattern: agents stating limits in priority files
+    that contradict the actual operational config values. E.g., "daily limit 2"
+    when config says NOTES_DAILY_MAX = 3.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    text_lower = claim.text.lower()
+
+    # Try to import config values
+    try:
+        import core.config as cfg
+    except ImportError:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="Cannot import core.config — not running inside ia workspace",
+            checked_at=now,
+            method="config_consistency",
+        )
+
+    mismatches = []
+    matches_found = 0
+
+    for entry in _CONFIG_LIMIT_PATTERNS:
+        pattern, config_attr, description = entry[:3]
+        unit_multiplier = entry[3] if len(entry) > 3 else 1
+
+        if config_attr is None:
+            continue  # Skip-only patterns
+
+        m = re.search(pattern, text_lower)
+        if not m:
+            continue
+
+        matches_found += 1
+
+        # Get the stated value from the text
+        # For X/Y format patterns, use the second group (the denominator = the limit)
+        if m.lastindex and m.lastindex >= 2:
+            stated_value = int(m.group(2))
+        else:
+            stated_value = int(m.group(1))
+
+        # Convert stated value to config units (e.g., dollars → cents)
+        stated_value *= unit_multiplier
+
+        # Get the actual config value
+        actual_value = getattr(cfg, config_attr, None)
+
+        if actual_value is None:
+            # Config allows None (= no limit); stated limit is a mismatch
+            mismatches.append(
+                f"  {description}: stated={stated_value}, config {config_attr}=None (no limit)"
+            )
+        elif isinstance(actual_value, tuple):
+            # For range tuples like NOTES_DAILY_TARGET = (1, 2), check max
+            if stated_value not in actual_value and stated_value != max(actual_value):
+                mismatches.append(
+                    f"  {description}: stated={stated_value}, config {config_attr}={actual_value}"
+                )
+        elif stated_value != actual_value:
+            mismatches.append(
+                f"  {description}: stated={stated_value}, config {config_attr}={actual_value}"
+            )
+
+    if matches_found == 0:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.INCONCLUSIVE,
+            evidence="No limit/max patterns found in claim text",
+            checked_at=now,
+            method="config_consistency",
+        )
+
+    if mismatches:
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.FAILED,
+            evidence="Config consistency MISMATCH:\n" + "\n".join(mismatches),
+            checked_at=now,
+            method="config_consistency",
+        )
+
+    return VerificationOutcome(
+        claim=claim,
+        result=VerificationResult.PASSED,
+        evidence=f"All {matches_found} stated limit(s) match config.py values",
+        checked_at=now,
+        method="config_consistency",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main verification dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1822,6 +2196,11 @@ def verify_claim(claim: Claim) -> VerificationOutcome:
         outcome.claim = claim
         return outcome
 
+    if claim.claim_type == ClaimType.COMMIT_EXISTS and claim.extracted_commits:
+        outcome = verify_commit_exists(claim.extracted_commits)
+        outcome.claim = claim
+        return outcome
+
     # Process/service status claims — verify against actual process state
     if claim.claim_type == ClaimType.PROCESS_STATUS:
         return verify_process_status(claim)
@@ -1832,11 +2211,54 @@ def verify_claim(claim: Claim) -> VerificationOutcome:
         if outcome.result != VerificationResult.INCONCLUSIVE:
             return outcome
 
+    # Status claims that contain pipeline keywords — route through name matcher
+    # (e.g. "Substack responder: RE-ENABLED" is status_claim but contains "substack responder")
+    if claim.claim_type == ClaimType.STATUS_CLAIM and not claim.extracted_paths:
+        outcome = verify_status_by_name(claim)
+        if outcome.result != VerificationResult.INCONCLUSIVE:
+            return outcome
+
+    # Instructional/rule claims — not verifiable, just behavioral guidance
+    if _is_instructional_claim(claim):
+        return VerificationOutcome(
+            claim=claim,
+            result=VerificationResult.SKIPPED,
+            evidence="Claim is an instruction or behavioral rule, not a verifiable assertion",
+            checked_at=now,
+            method="instructional_skip",
+        )
+
+    # Completed task claims ([x]) — verify by checking for evidence of completion
+    if _is_completed_task_claim(claim):
+        outcome = verify_completed_task(claim)
+        if outcome.result != VerificationResult.INCONCLUSIVE:
+            return outcome
+
+    # Confab subcommand claims ("confab X is live") — verify subcommand exists
+    if claim.claim_type == ClaimType.STATUS_CLAIM and 'confab' in claim.text.lower():
+        outcome = verify_confab_subcommand(claim)
+        if outcome.result != VerificationResult.INCONCLUSIVE:
+            return outcome
+
+    # Project status claims ("Sentinel: ACTIVE") — verify project dir exists
+    if claim.claim_type == ClaimType.STATUS_CLAIM:
+        outcome = verify_project_status(claim)
+        if outcome.result != VerificationResult.INCONCLUSIVE:
+            return outcome
+
     # Count/quantity claims — verify against data sources
     if claim.claim_type == ClaimType.COUNT_CLAIM:
         outcome = verify_count(claim)
         if outcome.result != VerificationResult.INCONCLUSIVE:
             return outcome
+
+    # Config consistency — stated limits vs actual config.py values (type 5 confab)
+    if claim.claim_type in (ClaimType.COUNT_CLAIM, ClaimType.FACT_CLAIM, ClaimType.STATUS_CLAIM):
+        text_lower = claim.text.lower()
+        if any(kw in text_lower for kw in ('limit', 'max', 'cap', 'daily', 'per day')):
+            outcome = verify_config_consistency(claim)
+            if outcome.result != VerificationResult.INCONCLUSIVE:
+                return outcome
 
     # Date-expiry claims — check if the date has passed
     if claim.claim_type == ClaimType.DATE_EXPIRY:

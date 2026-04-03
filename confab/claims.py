@@ -31,6 +31,7 @@ class ClaimType(Enum):
     COUNT_CLAIM = "count_claim"          # "X entries / N items / count of Y"
     STATUS_CLAIM = "status_claim"        # general status assertions
     FACT_CLAIM = "fact_claim"            # factual claims (dates, numbers)
+    COMMIT_EXISTS = "commit_exists"      # "commit abc1234", "see abc1234a"
     DATE_EXPIRY = "date_expiry"              # "expires Mon", "resolve Apr 5"
     REGISTRY_VIOLATION = "registry_violation"  # file/db not in SYSTEM_REGISTRY.md
     SUBJECTIVE = "subjective"            # opinions, assessments
@@ -82,6 +83,7 @@ class Claim:
     extracted_env_vars: List[str] = field(default_factory=list)  # Env vars mentioned
     extracted_numbers: List[str] = field(default_factory=list)  # Numbers/counts
     extracted_config_keys: List[str] = field(default_factory=list)  # Config keys to check
+    extracted_commits: List[str] = field(default_factory=list)  # Git commit hashes
     context: str = ""                  # Surrounding text for context
     age_builds: int = 0                # How many builds this has persisted
     confidence: float = 1.0            # 0.0-1.0 extraction confidence score
@@ -98,6 +100,7 @@ class Claim:
             "env_vars": self.extracted_env_vars,
             "numbers": self.extracted_numbers,
             "config_keys": self.extracted_config_keys,
+            "commits": self.extracted_commits,
             "age_builds": self.age_builds,
             "confidence": self.confidence,
         }
@@ -200,8 +203,10 @@ NARRATIVE_RE = re.compile(
 )
 
 # Build section header pattern (to track claim age)
+# Matches both builder-style "## Previous Build (date)" and
+# dreamer-style "## Previous session — date — context" headers.
 BUILD_HEADER_RE = re.compile(
-    r'^##\s+(?:Latest|Previous|Current)\s+Build\s+\((.+?)\)',
+    r'^##\s+(?:Latest|Previous|Current|Last)\s+(?:Build|session)\b',
     re.MULTILINE,
 )
 
@@ -299,6 +304,14 @@ PIPELINE_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Git commit reference pattern — matches commit hashes in backticks or after "commit"
+# Catches: `abc1234a`, `abc12345`, commit abc1234, Commits: abc1234
+COMMIT_REF_RE = re.compile(
+    r'(?:commit\s+|Commits?:\s*)([0-9a-f]{7,40})\b'
+    r'|`([0-9a-f]{7,40})`',
+    re.IGNORECASE,
+)
+
 # Date-expiry claims — lines containing BOTH expiry language AND a date reference.
 # Catches "expires Mon", "EXPIRY MON.", "resolve Apr 5", "Mon Mar 31: Gas contracts expire".
 # These are time-sensitive claims that become actionable (or stale) on a specific date.
@@ -358,6 +371,86 @@ INLINE_PATH_RE = re.compile(
 # Splits on ". " followed by an uppercase letter (new sentence), preserving
 # each sentence as a standalone unit for independent claim extraction.
 _SENTENCE_SPLIT_RE = re.compile(r'(?<=\.)\s+(?=[A-Z])')
+
+# ---------------------------------------------------------------------------
+# Generic claim patterns (for arbitrary agent output, not just ia files)
+# ---------------------------------------------------------------------------
+
+# Generic quantitative claims — "improved 40%", "handles 10K qps", "reduced by 50ms"
+# Catches change/measurement verbs paired with numbers (optionally suffixed with
+# %, K, M, B, x, ms, qps, etc.). Two forms:
+#   verb + [by/to] + number[suffix]  — "improved 40%", "handles 10K qps"
+#   number[suffix] + context_word    — "40% improvement", "3x faster"
+GENERIC_QUANTITATIVE_RE = re.compile(
+    r'(?:'
+    # Form 1: verb + number+suffix
+    r'(?:improv(?:ed|es?|ing)|reduc(?:ed|es?|ing)|increas(?:ed|es?|ing)|decreas(?:ed|es?|ing)'
+    r'|grew|dropped|surged|declined|rose|fell|cut|doubled|tripled|halved'
+    r'|handles?|processes?|serves?|supports?|achieves?|delivers?|generates?|produces?'
+    r'|takes?|costs?|saves?|consumes?|runs?\b|hits?|reaches?|exceeds?)'
+    r'\s+(?:by\s+|to\s+|at\s+|about\s+|approximately\s+|roughly\s+|nearly\s+|over\s+|under\s+|up\s+to\s+)?'
+    r'(?:\$\s*)?'
+    r'\d[\d,]*(?:\.\d+)?'
+    r'(?:\s*(?:%|percent|x|ms|seconds?|minutes?|hours?|K|M|B|k|m|b|GB|MB|TB|qps|rps|tps|ops(?:/s(?:ec)?)?))?'
+    r'|'
+    # Form 2: number+suffix + context word
+    r'(?:\$\s*)?'
+    r'\d[\d,]*(?:\.\d+)?'
+    r'\s*(?:%|percent|x|ms|seconds?|minutes?|hours?|K|M|B|k|m|b|GB|MB|TB|qps|rps|tps|ops(?:/s(?:ec)?)?)'
+    r'\s+(?:improv|reduc|increas|decreas|fast|slow|more|less|better|worse|higher|lower|gain|loss|drop|growth|decline)'
+    r')',
+    re.IGNORECASE,
+)
+
+# Generic temporal claims — "completed yesterday", "ships Friday", "deployed last week"
+# Catches action verbs paired with temporal references (day names, relative dates).
+GENERIC_TEMPORAL_RE = re.compile(
+    r'(?:'
+    # Form 1: verb + [prep] + time reference
+    r'(?:complet(?:ed|es?|ing)|deploy(?:ed|s|ing)?|shipp?(?:ed|s|ing)?|launch(?:ed|es|ing)?'
+    r'|releas(?:ed|es|ing)|migrat(?:ed|es|ing)|finish(?:ed|es|ing)|start(?:ed|s|ing)?'
+    r'|submitt?(?:ed|s|ing)?|deliver(?:ed|s|ing)?|publish(?:ed|es|ing)?'
+    r'|push(?:ed|es|ing)?|merg(?:ed|es|ing)|remov(?:ed|es|ing)|delet(?:ed|es|ing)'
+    r'|add(?:ed|s|ing)?|creat(?:ed|es|ing)|updat(?:ed|es|ing)|resolv(?:ed|es|ing)|fix(?:ed|es|ing)?)'
+    r'\s+(?:on\s+|by\s+|before\s+|after\s+|since\s+|until\s+)?'
+    r'(?:yesterday|today|tomorrow'
+    r'|last\s+(?:week|month|night|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day)'
+    r'|next\s+(?:week|month|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day)'
+    r'|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day'
+    r'|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}'
+    r'|\d{4}-\d{2}-\d{2})'
+    r'|'
+    # Form 2: time reference + verb
+    r'(?:yesterday|today|tomorrow'
+    r'|last\s+(?:week|month|night|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day)'
+    r'|next\s+(?:week|month|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day)'
+    r'|(?:Mon|Tue|Wednes|Thurs|Fri|Satur|Sun)day'
+    r'|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}'
+    r'|\d{4}-\d{2}-\d{2})'
+    r'\s*[,:]?\s*'
+    r'(?:complet(?:ed|es?|ing)|deploy(?:ed|s|ing)?|shipp?(?:ed|s|ing)?|launch(?:ed|es|ing)?'
+    r'|releas(?:ed|es|ing)|migrat(?:ed|es|ing)|finish(?:ed|es|ing)|start(?:ed|s|ing)?'
+    r'|submitt?(?:ed|s|ing)?|deliver(?:ed|s|ing)?|publish(?:ed|es|ing)?'
+    r'|push(?:ed|es|ing)?|merg(?:ed|es|ing)|remov(?:ed|es|ing)|delet(?:ed|es|ing)'
+    r'|add(?:ed|s|ing)?|creat(?:ed|es|ing)|updat(?:ed|es|ing)|resolv(?:ed|es|ing)|fix(?:ed|es|ing)?)'
+    r')',
+    re.IGNORECASE,
+)
+
+# Generic status assertions — "Migration completed", "server is operational", "bug fixed"
+# Catches subject + status-verb patterns without requiring ia-specific context.
+# Only matches when the status word is the MAIN assertion, not incidental.
+GENERIC_STATUS_RE = re.compile(
+    r'(?:^|[.!]\s+)'  # Start of line or new sentence
+    r'(?:\w+\s+){0,4}'  # Up to 4 words of subject
+    r'(?:is\s+|was\s+|has\s+been\s+|got\s+)?'
+    r'(?:completed?|deployed?|shipped|launched|released|migrated'
+    r'|operational|functional|live|working|running|serving|available'
+    r'|fixed|resolved|implemented|installed|configured|enabled|disabled'
+    r'|broken|down|failing|crashed|offline|degraded|unavailable)'
+    r'\s*[.!]?\s*$',  # End of line or sentence
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +701,24 @@ def extract_claims(
                 ))
                 continue
 
+        # --- Git commit reference claims ---
+        commit_matches = COMMIT_REF_RE.findall(line)
+        if commit_matches:
+            # Each match is a tuple (group1, group2) — one will be non-empty
+            hashes = [g1 or g2 for g1, g2 in commit_matches if g1 or g2]
+            if hashes:
+                claims.append(Claim(
+                    text=stripped,
+                    claim_type=ClaimType.COMMIT_EXISTS,
+                    verifiability=VerifiabilityLevel.AUTO,
+                    source_file=source_file,
+                    source_line=line_num,
+                    verification_tag=vtag,
+                    extracted_commits=hashes,
+                    age_builds=current_build_idx,
+                ))
+                continue
+
         # --- Status/error claims (error codes, expiry, timeouts) ---
         if STATUS_ERROR_RE.search(line):
             claims.append(Claim(
@@ -776,6 +887,56 @@ def extract_claims(
                 confidence=0.7,  # Lower confidence for approximate claims
                 age_builds=current_build_idx,
             ))
+            continue
+
+        # =================================================================
+        # Generic agent output fallbacks
+        # These catch claims in arbitrary text that doesn't use ia-specific
+        # formatting (bullet-point status, priority file structure, etc.).
+        # Placed last so ia-specific patterns take priority.
+        # =================================================================
+
+        # --- Generic quantitative claims: "improved 40%", "handles 10K qps" ---
+        if GENERIC_QUANTITATIVE_RE.search(line):
+            # Extract any numbers for the claim record
+            numbers = re.findall(r'\d[\d,]*(?:\.\d+)?(?:\s*[%KMBkmb])?', line)
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.FACT_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                extracted_numbers=numbers,
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Generic temporal claims: "completed yesterday", "ships Friday" ---
+        if GENERIC_TEMPORAL_RE.search(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.STATUS_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
+            continue
+
+        # --- Generic status assertions: "Migration completed.", "Server is operational." ---
+        if GENERIC_STATUS_RE.search(line):
+            claims.append(Claim(
+                text=stripped,
+                claim_type=ClaimType.STATUS_CLAIM,
+                verifiability=VerifiabilityLevel.SEMI,
+                source_file=source_file,
+                source_line=line_num,
+                verification_tag=vtag,
+                age_builds=current_build_idx,
+            ))
+            continue
 
     # Score confidence for each claim
     for claim in claims:
